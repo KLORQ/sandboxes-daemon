@@ -256,6 +256,28 @@ func (s *OperationStore) ListBySandbox(ctx context.Context, sandboxID string) ([
 	return out, rows.Err()
 }
 
+// ListUnfinished returns pending and running operations.
+func (s *OperationStore) ListUnfinished(ctx context.Context) ([]operation.Operation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, sandbox_id, kind, state, generation, idempotency_key, error, created_at, updated_at
+		FROM operations WHERE state IN ('pending','running') ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []operation.Operation
+	for rows.Next() {
+		var op operation.Operation
+		var created, updated int64
+		if err := rows.Scan(&op.ID, &op.SandboxID, &op.Kind, &op.State, &op.Generation, &op.IdempotencyKey, &op.Error, &created, &updated); err != nil {
+			return nil, err
+		}
+		op.CreatedAt = fromUnix(created)
+		op.UpdatedAt = fromUnix(updated)
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
 // Update updates an operation.
 func (s *OperationStore) Update(ctx context.Context, op operation.Operation) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE operations SET state=?, generation=?, error=?, updated_at=? WHERE id=?`,

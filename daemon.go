@@ -39,6 +39,13 @@ func Run(ctx context.Context, cfg Config) error {
 	defer func() { _ = st.Close() }()
 
 	svc := service.New(st)
+	changed, err := svc.Reconcile(ctx)
+	if err != nil {
+		return fmt.Errorf("reconcile: %w", err)
+	}
+	if changed > 0 {
+		slog.Info("reconciled interrupted state", "records", changed)
+	}
 	if err := removeStaleSocket(ctx, cfg.SocketPath); err != nil {
 		return err
 	}

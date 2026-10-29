@@ -17,13 +17,18 @@ import (
 
 // Service coordinates durable sandbox state and operations.
 type Service struct {
-	store *store.Store
-	now   func() time.Time
+	store   *store.Store
+	journal *operation.Journal
+	now     func() time.Time
 }
 
 // New creates a control-plane service.
 func New(st *store.Store) *Service {
-	return &Service{store: st, now: time.Now}
+	return &Service{
+		store:   st,
+		journal: operation.NewJournal(st.Operations()),
+		now:     time.Now,
+	}
 }
 
 // CreateRequest describes a new sandbox.
@@ -80,6 +85,39 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		return operation.Operation{}, err
 	}
 	return op, nil
+}
+
+// Reconcile repairs state left behind by an interrupted daemon.
+func (s *Service) Reconcile(ctx context.Context) (int, error) {
+	now := s.now().UTC()
+	changed := 0
+	all, err := s.listAll(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, sb := range all {
+		switch sb.State {
+		case sandbox.Running, sandbox.Creating, sandbox.Deleting:
+			sb.State = sandbox.Unknown
+			sb.Error = "daemon restarted; runtime state is unknown"
+			sb.UpdatedAt = now
+			if err := s.store.Update(ctx, sb); err != nil {
+				return changed, err
+			}
+			changed++
+		}
+	}
+	unfinished, err := s.store.Operations().ListUnfinished(ctx)
+	if err != nil {
+		return changed, err
+	}
+	for _, op := range unfinished {
+		if err := s.journal.Fail(ctx, op.ID, "daemon restarted"); err != nil {
+			return changed, err
+		}
+		changed++
+	}
+	return changed, nil
 }
 
 // Get returns a sandbox by ID.
@@ -200,6 +238,22 @@ func (s *Service) apply(ctx context.Context, sb sandbox.Sandbox, kind operation.
 		return operation.Operation{}, err
 	}
 	return op, nil
+}
+
+func (s *Service) listAll(ctx context.Context) ([]sandbox.Sandbox, error) {
+	var out []sandbox.Sandbox
+	token := ""
+	for {
+		items, next, err := s.store.List(ctx, sandbox.ListOptions{PageSize: 200, PageToken: token})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
+		if next == "" {
+			return out, nil
+		}
+		token = next
+	}
 }
 
 func newID(prefix string) (string, error) {
