@@ -31,9 +31,11 @@ sandboxesd --state "$HOME/.sandboxes"
 # containerd/nerdbox backend
 sandboxesd --state "$HOME/.sandboxes" \
   --containerd "$HOME/.sandboxes/containerd/containerd.sock" \
+  --gvproxy "$HOME/.sandboxes/bin/gvproxy-policy-v2" \
   --image alpine:3.22
 ```
 
 Empty `--containerd` keeps the state-only control plane. With a runtime backend,
-create/start/stop/delete call the runtime adapter; network and exec remain
-unsupported until the gateway and PTY stages.
+create/start/stop/delete call the runtime adapter. With `--gvproxy`, the daemon
+also starts a default-deny gateway and attaches nerdbox network annotations;
+exec/PTY still remain unsupported.
