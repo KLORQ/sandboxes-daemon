@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
@@ -11,6 +12,7 @@ import (
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -97,6 +99,63 @@ func (s *SandboxServer) Delete(ctx context.Context, req *localv1.DeleteRequest) 
 		return nil, mapError(err)
 	}
 	return &localv1.DeleteResponse{Operation: toProtoOperation(op)}, nil
+}
+
+// Watch streams current sandbox state changes.
+func (s *SandboxServer) Watch(req *localv1.WatchRequest, stream grpc.ServerStreamingServer[localv1.WatchResponse]) error {
+	ctx := stream.Context()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	seen := make(map[string]string)
+	for {
+		if err := s.sendChanges(ctx, req, stream, seen); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *SandboxServer) sendChanges(ctx context.Context, req *localv1.WatchRequest, stream grpc.ServerStreamingServer[localv1.WatchResponse], seen map[string]string) error {
+	if id := req.GetSandboxId(); id != "" {
+		sb, err := s.svc.Get(ctx, id)
+		if err != nil {
+			return mapError(err)
+		}
+		return sendSandbox(stream, seen, sb, req.GetAfterRevision())
+	}
+	token := ""
+	for {
+		items, next, err := s.svc.List(ctx, sandbox.ListOptions{PageSize: 200, PageToken: token})
+		if err != nil {
+			return mapError(err)
+		}
+		for _, sb := range items {
+			if err := sendSandbox(stream, seen, sb, req.GetAfterRevision()); err != nil {
+				return err
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		token = next
+	}
+}
+
+func sendSandbox(stream grpc.ServerStreamingServer[localv1.WatchResponse], seen map[string]string, sb sandbox.Sandbox, after int64) error {
+	key := fmt.Sprintf("%d/%s/%s", sb.Generation, sb.State, sb.Error)
+	if seen[sb.ID] == key || sb.Generation <= after {
+		return nil
+	}
+	seen[sb.ID] = key
+	return stream.Send(&localv1.WatchResponse{
+		Type:     "sandbox",
+		Sandbox:  toProtoSandbox(sb),
+		Revision: sb.Generation,
+	})
 }
 
 // Get returns an operation.

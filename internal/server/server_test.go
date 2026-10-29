@@ -5,6 +5,7 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
@@ -86,5 +87,60 @@ func TestGRPCLifecycle(t *testing.T) {
 
 	if _, err := operations.Get(ctx, &localv1.OperationServiceGetRequest{Id: created.GetOperation().GetId()}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGRPCWatch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	svc := service.New(st)
+	localv1.RegisterSandboxServiceServer(grpcServer, NewSandbox(svc))
+	localv1.RegisterOperationServiceServer(grpcServer, NewOperation(svc))
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	sandboxes := localv1.NewSandboxServiceClient(conn)
+
+	created, err := sandboxes.Create(ctx, &localv1.CreateRequest{Name: "dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := sandboxes.Watch(ctx, &localv1.WatchRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.GetType() != "sandbox" || event.GetSandbox().GetId() != created.GetOperation().GetSandboxId() {
+		t.Fatalf("unexpected event: %+v", event)
+	}
+	if _, err := sandboxes.Start(ctx, &localv1.StartRequest{Id: event.GetSandbox().GetId()}); err != nil {
+		t.Fatal(err)
+	}
+	event, err = stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.GetSandbox().GetState() != localv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("unexpected state: %s", event.GetSandbox().GetState())
 	}
 }
