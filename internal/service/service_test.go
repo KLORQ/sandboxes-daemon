@@ -10,6 +10,7 @@ import (
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
+	runtime "github.com/KLORQ/sandboxes-runtime"
 
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
@@ -21,7 +22,7 @@ func TestLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	svc := New(st)
+	svc := New(st, nil)
 
 	op, err := svc.Create(ctx, CreateRequest{Name: "dev", Image: "scratch"})
 	if err != nil {
@@ -69,7 +70,7 @@ func TestDuplicateName(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	svc := New(st)
+	svc := New(st, nil)
 
 	if _, err := svc.Create(ctx, CreateRequest{Name: "dev"}); err != nil {
 		t.Fatal(err)
@@ -86,7 +87,7 @@ func TestDeleteRunningRequiresForce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	svc := New(st)
+	svc := New(st, nil)
 
 	op, err := svc.Create(ctx, CreateRequest{Name: "dev"})
 	if err != nil {
@@ -126,7 +127,7 @@ func TestReconcileInterruptedState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := New(st)
+	svc := New(st, nil)
 	changed, err := svc.Reconcile(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -141,5 +142,62 @@ func TestReconcileInterruptedState(t *testing.T) {
 	gotOp, err := st.Operations().Get(ctx, "op-1")
 	if err != nil || gotOp.State != operation.Failed {
 		t.Fatalf("operation: %+v, %v", gotOp, err)
+	}
+}
+
+type fakeRuntime struct {
+	created int
+	started int
+	stopped int
+	deleted int
+}
+
+func (f *fakeRuntime) Capabilities(context.Context) (runtime.Capabilities, error) {
+	return runtime.Capabilities{Workspace: true}, nil
+}
+func (f *fakeRuntime) Create(_ context.Context, cfg runtime.Config) (runtime.Handle, error) {
+	f.created++
+	return runtime.Handle{ID: "klorq-" + cfg.Name}, nil
+}
+func (f *fakeRuntime) Start(context.Context, runtime.Handle) error { f.started++; return nil }
+func (f *fakeRuntime) Stop(context.Context, runtime.Handle, time.Duration) error {
+	f.stopped++
+	return nil
+}
+func (f *fakeRuntime) Delete(context.Context, runtime.Handle) error { f.deleted++; return nil }
+func (f *fakeRuntime) Handle(name string) runtime.Handle            { return runtime.Handle{ID: "klorq-" + name} }
+
+func TestLifecycleWithRuntime(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+
+	op, err := svc.Create(ctx, CreateRequest{Name: "dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := svc.Get(ctx, op.SandboxID)
+	if err != nil || sb.State != sandbox.Running {
+		t.Fatalf("create: %+v, %v", sb, err)
+	}
+	if _, err := svc.Start(ctx, sb.ID); !errors.Is(err, core.ErrConflict) {
+		t.Fatalf("expected running conflict, got %v", err)
+	}
+	if _, err := svc.Stop(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Start(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Delete(ctx, sb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if backend.created != 1 || backend.stopped != 1 || backend.started != 1 || backend.deleted != 1 {
+		t.Fatalf("backend calls: %+v", backend)
 	}
 }

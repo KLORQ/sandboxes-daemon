@@ -12,6 +12,7 @@ import (
 	"time"
 
 	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/KLORQ/sandboxes-runtime"
 	"google.golang.org/grpc"
 
 	"github.com/KLORQ/sandboxes-daemon/internal/server"
@@ -21,8 +22,10 @@ import (
 
 // Config is the daemon configuration.
 type Config struct {
-	SocketPath string
-	StateDir   string
+	SocketPath   string
+	StateDir     string
+	Backend      runtime.Backend
+	DefaultImage string
 }
 
 // Run starts the daemon and blocks until ctx is canceled.
@@ -39,7 +42,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	svc := service.New(st)
+	svc := service.New(st, cfg.Backend)
+	if cfg.DefaultImage != "" {
+		svc.DefaultImage = cfg.DefaultImage
+	}
 	changed, err := svc.Reconcile(ctx)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
