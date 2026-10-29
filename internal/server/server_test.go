@@ -28,7 +28,7 @@ func TestGRPCLifecycle(t *testing.T) {
 
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	svc := service.New(st)
+	svc := service.New(st, nil)
 	localv1.RegisterSandboxServiceServer(grpcServer, NewSandbox(svc))
 	localv1.RegisterOperationServiceServer(grpcServer, NewOperation(svc))
 	go func() { _ = grpcServer.Serve(lis) }()
@@ -102,7 +102,7 @@ func TestGRPCWatch(t *testing.T) {
 
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	svc := service.New(st)
+	svc := service.New(st, nil)
 	localv1.RegisterSandboxServiceServer(grpcServer, NewSandbox(svc))
 	localv1.RegisterOperationServiceServer(grpcServer, NewOperation(svc))
 	go func() { _ = grpcServer.Serve(lis) }()

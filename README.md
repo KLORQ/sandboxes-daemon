@@ -21,3 +21,19 @@ go run ./cmd/sandboxesd \
 
 The daemon owns `sandboxes.db`, exposes a local gRPC socket with `0600`
 permissions, and removes a stale socket only after a failed liveness probe.
+
+Runtime mode is explicit:
+
+```sh
+# state-only default
+sandboxesd --state "$HOME/.sandboxes"
+
+# containerd/nerdbox backend
+sandboxesd --state "$HOME/.sandboxes" \
+  --containerd "$HOME/.sandboxes/containerd/containerd.sock" \
+  --image alpine:3.22
+```
+
+Empty `--containerd` keeps the state-only control plane. With a runtime backend,
+create/start/stop/delete call the runtime adapter; network and exec remain
+unsupported until the gateway and PTY stages.

@@ -12,23 +12,28 @@ import (
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
+	runtime "github.com/KLORQ/sandboxes-runtime"
 
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
 // Service coordinates durable sandbox state and operations.
 type Service struct {
-	store   *store.Store
-	journal *operation.Journal
-	now     func() time.Time
+	store        *store.Store
+	journal      *operation.Journal
+	backend      runtime.Backend
+	DefaultImage string
+	now          func() time.Time
 }
 
 // New creates a control-plane service.
-func New(st *store.Store) *Service {
+func New(st *store.Store, backend runtime.Backend) *Service {
 	return &Service{
-		store:   st,
-		journal: operation.NewJournal(st.Operations()),
-		now:     time.Now,
+		store:        st,
+		journal:      operation.NewJournal(st.Operations()),
+		backend:      backend,
+		DefaultImage: "alpine:3.22",
+		now:          time.Now,
 	}
 }
 
@@ -60,12 +65,28 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	}
 	image := req.Image
 	if image == "" {
-		image = "scratch"
+		image = s.DefaultImage
+	}
+	state := sandbox.Stopped
+	var handle runtime.Handle
+	if s.backend != nil {
+		var err error
+		handle, err = s.backend.Create(ctx, runtime.Config{
+			Name:      name,
+			Image:     image,
+			Workspace: req.Workspace,
+			CPUs:      2,
+			MemoryMiB: 1024,
+		})
+		if err != nil {
+			return operation.Operation{}, err
+		}
+		state = sandbox.Running
 	}
 	sb := sandbox.Sandbox{
 		ID:         sbID,
 		Name:       name,
-		State:      sandbox.Stopped,
+		State:      state,
 		Generation: 1,
 		Image:      image,
 		Workspace:  req.Workspace,
@@ -83,6 +104,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		UpdatedAt:      now,
 	}
 	if err := s.store.CreateSandboxWithOperation(ctx, sb, op); err != nil {
+		if s.backend != nil {
+			_ = s.backend.Delete(ctx, handle)
+		}
 		return operation.Operation{}, err
 	}
 	return op, nil
@@ -150,6 +174,11 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
+	if s.backend != nil {
+		if err := s.backend.Start(ctx, s.backend.Handle(sb.Name)); err != nil {
+			return operation.Operation{}, err
+		}
+	}
 	return s.apply(ctx, sb, operation.KindStart, sandbox.Running)
 }
 
@@ -162,6 +191,11 @@ func (s *Service) Stop(ctx context.Context, id string) (operation.Operation, err
 	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
+	if s.backend != nil {
+		if err := s.backend.Stop(ctx, s.backend.Handle(sb.Name), 5*time.Second); err != nil {
+			return operation.Operation{}, err
+		}
+	}
 	return s.apply(ctx, sb, operation.KindStop, sandbox.Stopped)
 }
 
@@ -173,6 +207,11 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 	}
 	if sb.State == sandbox.Running && !force {
 		return operation.Operation{}, fmt.Errorf("%w: running sandbox requires force", core.ErrConflict)
+	}
+	if s.backend != nil {
+		if err := s.backend.Delete(ctx, s.backend.Handle(sb.Name)); err != nil && !force {
+			return operation.Operation{}, err
+		}
 	}
 	now := s.now().UTC()
 	opID, err := newID("op")
