@@ -29,6 +29,8 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Lint
-        run: golangci-lint run ./...
+        run: |
+          golangci-lint config verify
+          golangci-lint run ./...
       - name: Vulnerability check
         run: govulncheck ./...

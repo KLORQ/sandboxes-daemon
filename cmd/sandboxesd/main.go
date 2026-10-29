@@ -15,6 +15,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		socketPath string
 		stateDir   string
@@ -22,8 +26,8 @@ func main() {
 	)
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "resolve home directory:", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintln(os.Stderr, "resolve home directory:", err)
+		return 1
 	}
 	defaultState := filepath.Join(home, ".sandboxes")
 	flag.StringVar(&stateDir, "state", defaultState, "state directory")
@@ -33,13 +37,14 @@ func main() {
 
 	if showVer {
 		_, _ = fmt.Fprintln(os.Stdout, version.Version)
-		return
+		return 0
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := daemon.Run(ctx, daemon.Config{SocketPath: socketPath, StateDir: stateDir}); err != nil {
 		slog.Error("daemon stopped", "error", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }

@@ -3,33 +3,124 @@ version: "2"
 run:
   timeout: 5m
   tests: true
+  relative-path-mode: gomod
 
 linters:
-  default: none
-  settings:
-    revive:
-      rules:
-        - name: exported
-          disabled: true
   enable:
-    - errcheck
+    - gocyclo
+    - gocognit
+    - funlen
+    - maintidx
+    - cyclop
+    - nestif
     - govet
     - staticcheck
-    - ineffassign
-    - unused
-    - gosec
-    - revive
-    - misspell
-    - bodyclose
-    - noctx
-    - rowserrcheck
-    - sqlclosecheck
+    - errcheck
     - errorlint
+    - gosec
+    - nilnil
     - nilerr
-    - prealloc
+    - ineffassign
+    - misspell
+    - whitespace
     - unconvert
+    - unparam
+    - errname
+    - revive
+    - prealloc
+    - bodyclose
+    - makezero
+    - goconst
+    - gocritic
+    - goprintffuncname
+    - nolintlint
+    - nakedret
+    - dupl
+    - dogsled
+    - durationcheck
+
+  settings:
+    govet:
+      enable:
+        - copylocks
+      disable:
+        - fieldalignment
+    gocyclo:
+      min-complexity: 15
+    cyclop:
+      max-complexity: 15
+    funlen:
+      lines: 100
+      statements: 50
+    gocognit:
+      min-complexity: 20
+    misspell:
+      locale: US
+    nestif:
+      min-complexity: 4
+    revive:
+      rules:
+        - name: var-naming
+        - name: error-return
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: var-declaration
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - commentFormatting
+        - whyNoLint
+        - unnamedResult
+        - commentedOutCode
+        - octalLiteral
+        - paramTypeCombine
+      settings:
+        hugeParam:
+          sizeThreshold: 256
+
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - cyclop
+          - funlen
+          - maintidx
+          - errcheck
+          - gosec
+          - goconst
+          - dupl
+          - gocognit
+          - nilnil
+          - bodyclose
+          - unparam
+          - gocritic
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
 
 formatters:
   enable:
     - gofmt
     - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/KLORQ/sandboxes-daemon

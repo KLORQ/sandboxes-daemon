@@ -12,10 +12,11 @@ import (
 	"time"
 
 	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	"google.golang.org/grpc"
+
 	"github.com/KLORQ/sandboxes-daemon/internal/server"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
-	"google.golang.org/grpc"
 )
 
 // Config is the daemon configuration.

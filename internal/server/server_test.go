@@ -8,13 +8,14 @@ import (
 	"time"
 
 	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+
+	"github.com/KLORQ/sandboxes-daemon/internal/service"
+	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
 func TestGRPCLifecycle(t *testing.T) {

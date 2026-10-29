@@ -16,6 +16,7 @@ fmt:
 	gofmt -w .
 
 lint:
+	golangci-lint config verify
 	golangci-lint run ./...
 
 vuln:

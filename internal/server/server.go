@@ -11,10 +11,11 @@ import (
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/KLORQ/sandboxes-daemon/internal/service"
 )
 
 // SandboxServer implements the sandbox gRPC service.
@@ -68,8 +69,8 @@ func (s *SandboxServer) List(ctx context.Context, req *localv1.ListRequest) (*lo
 		return nil, mapError(err)
 	}
 	resp := &localv1.ListResponse{NextPageToken: next, Items: make([]*localv1.Sandbox, 0, len(items))}
-	for _, item := range items {
-		resp.Items = append(resp.Items, toProtoSandbox(item))
+	for i := range items {
+		resp.Items = append(resp.Items, toProtoSandbox(items[i]))
 	}
 	return resp, nil
 }
@@ -133,8 +134,8 @@ func (s *SandboxServer) sendChanges(ctx context.Context, req *localv1.WatchReque
 		if err != nil {
 			return mapError(err)
 		}
-		for _, sb := range items {
-			if err := sendSandbox(stream, seen, sb, req.GetAfterRevision()); err != nil {
+		for i := range items {
+			if err := sendSandbox(stream, seen, items[i], req.GetAfterRevision()); err != nil {
 				return err
 			}
 		}

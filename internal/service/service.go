@@ -12,6 +12,7 @@ import (
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
+
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
@@ -95,7 +96,8 @@ func (s *Service) Reconcile(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, sb := range all {
+	for i := range all {
+		sb := all[i]
 		switch sb.State {
 		case sandbox.Running, sandbox.Creating, sandbox.Deleting:
 			sb.State = sandbox.Unknown
@@ -111,7 +113,8 @@ func (s *Service) Reconcile(ctx context.Context) (int, error) {
 	if err != nil {
 		return changed, err
 	}
-	for _, op := range unfinished {
+	for i := range unfinished {
+		op := unfinished[i]
 		if err := s.journal.Fail(ctx, op.ID, "daemon restarted"); err != nil {
 			return changed, err
 		}
