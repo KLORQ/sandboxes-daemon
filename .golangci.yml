@@ -1,0 +1,35 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - gosec
+    - revive
+    - misspell
+    - bodyclose
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - errorlint
+    - nilerr
+    - prealloc
+    - unconvert
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
