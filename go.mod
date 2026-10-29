@@ -10,7 +10,8 @@ require (
 )
 
 require (
-	github.com/KLORQ/sandboxes-runtime v0.0.4 // indirect
+	github.com/KLORQ/sandboxes-gateway v0.0.2 // indirect
+	github.com/KLORQ/sandboxes-runtime v0.0.5 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
