@@ -84,6 +84,32 @@ func TestDuplicateName(t *testing.T) {
 	}
 }
 
+func TestCreateBakesValidatedEnv(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	if _, err := svc.Create(ctx, CreateRequest{Name: "env-ok", Env: map[string]string{"B": "2", "A": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(backend.lastConfig.Env, ","); got != "A=1,B=2" {
+		t.Fatalf("env = %q", got)
+	}
+	for _, env := range []map[string]string{
+		{"BAD-NAME": "x"},
+		{"A": "x\x00y"},
+		{strings.Repeat("K", 256): "x"},
+	} {
+		if _, err := svc.Create(ctx, CreateRequest{Name: "env-bad", Env: env}); err == nil {
+			t.Fatalf("invalid env accepted: %v", env)
+		}
+	}
+}
+
 func TestCreateRejectsUnsafeNamesBeforeRuntime(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))

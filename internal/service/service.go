@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -548,6 +549,8 @@ type CreateRequest struct {
 	Deny       []sandbox.NetworkRule
 	Agent      string
 	Detached   bool
+	// Env is baked into the sandbox runtime; it is never written to SQLite.
+	Env map[string]string
 }
 
 // Create creates a stopped sandbox and a completed create operation.
@@ -561,7 +564,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		return operation.Operation{}, err
 	}
 	defer release()
-	image, cpus, memoryMiB, err := s.resolveCreateResources(req)
+	image, cpus, memoryMiB, env, err := s.resolveCreateResources(req)
 	if err != nil {
 		return operation.Operation{}, err
 	}
@@ -612,6 +615,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 			Deny:       runtimeRules(deny),
 			CPUs:       uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
 			MemoryMiB:  memoryMiB,
+			Env:        env,
 		})
 		if err != nil {
 			return operation.Operation{}, err
@@ -635,7 +639,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	return op, nil
 }
 
-func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uint32, error) {
+func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uint32, []string, error) {
 	image := req.Image
 	if image == "" {
 		image = s.DefaultImage
@@ -648,9 +652,13 @@ func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uin
 		memoryMiB = 1024
 	}
 	if cpus > 64 || memoryMiB < 128 || memoryMiB > 65536 {
-		return "", 0, 0, fmt.Errorf("%w: invalid CPU or memory request", core.ErrConflict)
+		return "", 0, 0, nil, fmt.Errorf("%w: invalid CPU or memory request", core.ErrConflict)
 	}
-	return image, cpus, memoryMiB, nil
+	env, err := normalizeCreateEnv(req.Env)
+	if err != nil {
+		return "", 0, 0, nil, err
+	}
+	return image, cpus, memoryMiB, env, nil
 }
 
 func normalizeCreateWorkspaces(req CreateRequest) (string, []sandbox.Workspace, error) {
@@ -960,6 +968,67 @@ func (s *Service) acquireCreateGates(ctx context.Context, name, key string) (fun
 		}
 	}
 	return release, nil
+}
+
+const (
+	maxCreateEnvEntries = 256
+	maxCreateEnvEntry   = 64 * 1024
+	maxCreateEnvTotal   = 256 * 1024
+)
+
+func normalizeCreateEnv(input map[string]string) ([]string, error) {
+	if len(input) == 0 {
+		return nil, nil
+	}
+	if len(input) > maxCreateEnvEntries {
+		return nil, fmt.Errorf("%w: too many environment entries", core.ErrConflict)
+	}
+	keys := make([]string, 0, len(input))
+	for key := range input {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	total := 0
+	for _, key := range keys {
+		value := input[key]
+		if !validCreateEnvName(key) {
+			return nil, fmt.Errorf("%w: invalid environment name", core.ErrConflict)
+		}
+		if strings.ContainsRune(value, '\x00') {
+			return nil, fmt.Errorf("%w: environment value contains NUL", core.ErrConflict)
+		}
+		entry := key + "=" + value
+		if len(entry) > maxCreateEnvEntry {
+			return nil, fmt.Errorf("%w: environment entry is too large", core.ErrConflict)
+		}
+		total += len(entry)
+		if total > maxCreateEnvTotal {
+			return nil, fmt.Errorf("%w: environment is too large", core.ErrConflict)
+		}
+		env = append(env, entry)
+	}
+	return env, nil
+}
+
+func validCreateEnvName(name string) bool {
+	if name == "" || len(name) > 255 || !createEnvNameStart(name[0]) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !createEnvNameChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func createEnvNameStart(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func createEnvNameChar(c byte) bool {
+	return createEnvNameStart(c) || (c >= '0' && c <= '9')
 }
 
 type createIntent struct {
