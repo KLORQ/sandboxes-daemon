@@ -6,7 +6,7 @@ require (
 	github.com/KLORQ/sandboxes-api v0.0.5
 	github.com/KLORQ/sandboxes-core v0.0.4
 	github.com/KLORQ/sandboxes-gateway v0.0.3
-	github.com/KLORQ/sandboxes-runtime v0.0.8
+	github.com/KLORQ/sandboxes-runtime v0.0.9
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0
