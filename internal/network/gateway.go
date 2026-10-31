@@ -13,6 +13,8 @@ import (
 // Manager is the subset of the gateway manager used by the adapter.
 type Manager interface {
 	Start(ctx context.Context, p policy.Policy) (gateway.Network, error)
+	Reload(ctx context.Context, p policy.Policy) error
+	SetPorts(ctx context.Context, name string, ports []policy.Port) error
 	Stop(ctx context.Context, name string) error
 }
 
@@ -28,11 +30,18 @@ func New(manager Manager, auditDir string) *Adapter {
 }
 
 // Start starts a gateway with a default-deny policy.
-func (a *Adapter) Start(ctx context.Context, sandbox string) (runtime.NetworkAttachment, error) {
+func (a *Adapter) Start(ctx context.Context, sandbox string, ports []runtime.Port, allow, deny []runtime.Rule) (runtime.NetworkAttachment, error) {
+	policyPorts := make([]policy.Port, 0, len(ports))
+	for _, port := range ports {
+		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol})
+	}
 	net, err := a.manager.Start(ctx, policy.Policy{
 		Revision:  1,
 		SandboxID: sandbox,
 		AuditPath: filepath.Join(a.auditDir, sandbox+".audit.jsonl"),
+		Ports:     policyPorts,
+		Allow:     toPolicyRules(allow, policy.Allow),
+		Deny:      toPolicyRules(deny, policy.Deny),
 	})
 	if err != nil {
 		return runtime.NetworkAttachment{}, err
@@ -47,8 +56,39 @@ func (a *Adapter) Start(ctx context.Context, sandbox string) (runtime.NetworkAtt
 }
 
 // Stop stops the sandbox gateway.
+func (a *Adapter) UpdatePolicy(ctx context.Context, sandbox string, ports []runtime.Port, allow, deny []runtime.Rule, revision int) error {
+	policyPorts := make([]policy.Port, 0, len(ports))
+	for _, port := range ports {
+		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol})
+	}
+	return a.manager.Reload(ctx, policy.Policy{
+		Revision:  revision,
+		SandboxID: sandbox,
+		AuditPath: filepath.Join(a.auditDir, sandbox+".audit.jsonl"),
+		Ports:     policyPorts,
+		Allow:     toPolicyRules(allow, policy.Allow),
+		Deny:      toPolicyRules(deny, policy.Deny),
+	})
+}
+
+func (a *Adapter) UpdatePorts(ctx context.Context, sandbox string, ports []runtime.Port) error {
+	policyPorts := make([]policy.Port, 0, len(ports))
+	for _, port := range ports {
+		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol})
+	}
+	return a.manager.SetPorts(ctx, sandbox, policyPorts)
+}
+
 func (a *Adapter) Stop(ctx context.Context, sandbox string) error {
 	return a.manager.Stop(ctx, sandbox)
 }
 
 var _ runtime.Network = (*Adapter)(nil)
+
+func toPolicyRules(rules []runtime.Rule, action policy.Action) []policy.Rule {
+	out := make([]policy.Rule, 0, len(rules))
+	for i := range rules {
+		out = append(out, policy.Rule{Action: action, Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port})
+	}
+	return out
+}

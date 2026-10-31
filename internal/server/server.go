@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
 )
 
@@ -30,19 +31,197 @@ type OperationServer struct {
 	svc *service.Service
 }
 
+// RegistryCredentialServer stores credentials in the host keychain.
+type RegistryCredentialServer struct {
+	localv1.UnimplementedRegistryCredentialServiceServer
+	svc *service.Service
+}
+
+// AccountServer exposes host-side OAuth login without returning tokens.
+type AccountServer struct {
+	localv1.UnimplementedAccountServiceServer
+	svc *service.Service
+}
+
 // NewSandbox creates a sandbox gRPC service.
 func NewSandbox(svc *service.Service) *SandboxServer { return &SandboxServer{svc: svc} }
 
 // NewOperation creates an operation gRPC service.
 func NewOperation(svc *service.Service) *OperationServer { return &OperationServer{svc: svc} }
 
+// NewRegistryCredential creates the host registry credential service.
+func NewRegistryCredential(svc *service.Service) *RegistryCredentialServer {
+	return &RegistryCredentialServer{svc: svc}
+}
+
+// NewAccount creates the host account OAuth service.
+func NewAccount(svc *service.Service) *AccountServer { return &AccountServer{svc: svc} }
+
+func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLoginRequest) (*localv1.AccountServiceLoginResponse, error) {
+	provider := req.GetProvider()
+	if provider == "" {
+		provider = "docker"
+	}
+	loginCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	if err := s.svc.LoginAccount(loginCtx, provider); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+		}
+		if errors.Is(err, service.ErrOAuthPartialLogin) {
+			return nil, status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run ksbx logout before retrying")
+		}
+		return nil, status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
+	}
+	return &localv1.AccountServiceLoginResponse{Provider: provider, Authenticated: true}, nil
+}
+
+func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountServiceLoginWithPATRequest) (*localv1.AccountServiceLoginWithPATResponse, error) {
+	password := req.GetPassword()
+	defer clear(password)
+	if err := s.svc.LoginDockerHubPAT(ctx, req.GetUsername(), password); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return nil, mapError(err)
+		case errors.Is(err, service.ErrDockerHubCredentialRejected):
+			return nil, status.Error(codes.Unauthenticated, "Docker Hub rejected the supplied credentials")
+		case errors.Is(err, registrycredentials.ErrInvalidCredential):
+			return nil, status.Error(codes.InvalidArgument, "invalid Docker Hub credentials")
+		case errors.Is(err, service.ErrOAuthCredentialConflict):
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		case errors.Is(err, service.ErrOAuthPartialLogin):
+			return nil, status.Error(codes.FailedPrecondition, "Docker login may have partially completed; run ksbx logout before retrying")
+		default:
+			return nil, status.Error(codes.Unavailable, "Docker Hub login could not be completed")
+		}
+	}
+	return &localv1.AccountServiceLoginWithPATResponse{Authenticated: true}, nil
+}
+
+func (s *AccountServer) Logout(ctx context.Context, req *localv1.AccountServiceLogoutRequest) (*localv1.AccountServiceLogoutResponse, error) {
+	provider := req.GetProvider()
+	if provider == "" {
+		provider = "docker"
+	}
+	removed, err := s.svc.LogoutAccount(ctx, provider)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+		}
+		if errors.Is(err, service.ErrOAuthRevocationFailed) || errors.Is(err, service.ErrOAuthRevocationUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return nil, status.Error(codes.Unavailable, "OAuth host keychain operation failed")
+	}
+	return &localv1.AccountServiceLogoutResponse{Removed: removed}, nil
+}
+
+// Login stores registry credentials without returning or logging secret data.
+func (s *RegistryCredentialServer) Login(ctx context.Context, req *localv1.RegistryCredentialServiceLoginRequest) (*localv1.RegistryCredentialServiceLoginResponse, error) {
+	defer clear(req.Password)
+	scope := registrycredentials.ScopeHostOnly
+	switch req.GetScope() {
+	case localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_UNSPECIFIED,
+		localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_HOST_ONLY:
+	case localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_ALL_SANDBOXES:
+		scope = registrycredentials.ScopeAllSandboxes
+	case localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_SANDBOX:
+		scope = registrycredentials.ScopeSandbox
+	default:
+		return nil, status.Error(codes.InvalidArgument, "registry credential scope is invalid")
+	}
+	summary, err := s.svc.LoginRegistry(ctx, registrycredentials.Credential{
+		Registry: req.GetRegistry(), Username: req.GetUsername(), Password: req.GetPassword(),
+		Scope: scope, SandboxName: req.GetSandboxName(),
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, registrycredentials.ErrInvalidCredential) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return nil, status.Error(codes.Unavailable, "host registry credential store is unavailable")
+	}
+	protoScope := localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_HOST_ONLY
+	switch summary.Scope {
+	case registrycredentials.ScopeAllSandboxes:
+		protoScope = localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_ALL_SANDBOXES
+	case registrycredentials.ScopeSandbox:
+		protoScope = localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_SANDBOX
+	}
+	return &localv1.RegistryCredentialServiceLoginResponse{
+		Registry: summary.Registry, Username: summary.Username, Scope: protoScope, SandboxName: summary.SandboxName,
+	}, nil
+}
+
+// Logout removes one registry credential without exposing the stored value.
+func (s *RegistryCredentialServer) List(ctx context.Context, _ *localv1.RegistryCredentialServiceListRequest) (*localv1.RegistryCredentialServiceListResponse, error) {
+	summaries, err := s.svc.ListRegistryCredentials(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, "registry credential index is unavailable")
+	}
+	out := make([]*localv1.RegistryCredentialSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		out = append(out, &localv1.RegistryCredentialSummary{
+			Registry: summary.Registry, Username: summary.Username,
+			Scope: string(summary.Scope), SandboxName: summary.SandboxName,
+		})
+	}
+	return &localv1.RegistryCredentialServiceListResponse{Credentials: out}, nil
+}
+
+func (s *RegistryCredentialServer) Logout(ctx context.Context, req *localv1.RegistryCredentialServiceLogoutRequest) (*localv1.RegistryCredentialServiceLogoutResponse, error) {
+	scope := registrycredentials.ScopeHostOnly
+	switch req.GetScope() {
+	case localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_UNSPECIFIED,
+		localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_HOST_ONLY:
+	case localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_ALL_SANDBOXES:
+		scope = registrycredentials.ScopeAllSandboxes
+	case localv1.RegistryCredentialScope_REGISTRY_CREDENTIAL_SCOPE_SANDBOX:
+		scope = registrycredentials.ScopeSandbox
+	default:
+		return nil, status.Error(codes.InvalidArgument, "registry credential scope is invalid")
+	}
+	removed, err := s.svc.LogoutRegistry(ctx, req.GetRegistry(), scope, req.GetSandboxName())
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, registrycredentials.ErrInvalidCredential) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return nil, status.Error(codes.Unavailable, "host registry credential store is unavailable")
+	}
+	return &localv1.RegistryCredentialServiceLogoutResponse{Removed: removed}, nil
+}
+
 // Create creates a sandbox.
 func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) (*localv1.CreateResponse, error) {
+	allow := fromProtoRules(req.GetAllow())
+	deny := fromProtoRules(req.GetDeny())
+	if len(allow) != len(req.GetAllow()) || len(deny) != len(req.GetDeny()) {
+		return nil, status.Error(codes.InvalidArgument, "network rules must have valid ports")
+	}
 	op, err := s.svc.Create(ctx, service.CreateRequest{
 		Name:           req.GetName(),
 		Image:          req.GetImage(),
 		Workspace:      req.GetWorkspace(),
 		IdempotencyKey: req.GetIdempotencyKey(),
+		CPUs:           req.GetCpus(),
+		MemoryMiB:      req.GetMemoryMib(),
+		Workspaces:     fromProtoWorkspaces(req.GetWorkspaces()),
+		Ports:          fromProtoPorts(req.GetPorts()),
+		Allow:          allow,
+		Deny:           deny,
+		Agent:          req.GetAgent(),
+		Detached:       req.GetDetached(),
 	})
 	if err != nil {
 		return nil, mapError(err)
@@ -86,11 +265,41 @@ func (s *SandboxServer) Start(ctx context.Context, req *localv1.StartRequest) (*
 
 // Stop stops a sandbox.
 func (s *SandboxServer) Stop(ctx context.Context, req *localv1.StopRequest) (*localv1.StopResponse, error) {
-	op, err := s.svc.Stop(ctx, req.GetId())
+	if req.GetGraceSeconds() < 0 || req.GetGraceSeconds() > 3600 {
+		return nil, status.Error(codes.InvalidArgument, "grace_seconds must be between 0 and 3600")
+	}
+	op, err := s.svc.StopWithGrace(ctx, req.GetId(), time.Duration(req.GetGraceSeconds())*time.Second)
 	if err != nil {
 		return nil, mapError(err)
 	}
 	return &localv1.StopResponse{Operation: toProtoOperation(op)}, nil
+}
+
+// UpdatePolicy replaces the stored and live egress policy.
+func (s *SandboxServer) UpdatePolicy(context.Context, *localv1.UpdatePolicyRequest) (*localv1.UpdatePolicyResponse, error) {
+	return nil, status.Error(codes.FailedPrecondition, "policy replacement is unsafe; upgrade client to atomic policy operations")
+}
+
+// MutatePolicy changes one rule atomically against the current stored policy.
+func (s *SandboxServer) MutatePolicy(ctx context.Context, req *localv1.MutatePolicyRequest) (*localv1.MutatePolicyResponse, error) {
+	rules := fromProtoRules([]*localv1.NetworkRule{req.GetRule()})
+	if len(rules) != 1 {
+		return nil, status.Error(codes.InvalidArgument, "policy rule is required and must have a valid port")
+	}
+	sb, err := s.svc.MutatePolicy(ctx, req.GetId(), req.GetAction(), rules[0])
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &localv1.MutatePolicyResponse{Sandbox: toProtoSandbox(sb)}, nil
+}
+
+// UpdatePorts replaces the stored and live published ports.
+func (s *SandboxServer) UpdatePorts(ctx context.Context, req *localv1.UpdatePortsRequest) (*localv1.UpdatePortsResponse, error) {
+	sb, err := s.svc.UpdatePorts(ctx, req.GetId(), fromProtoPorts(req.GetPorts()))
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &localv1.UpdatePortsResponse{Sandbox: toProtoSandbox(sb)}, nil
 }
 
 // Delete deletes a sandbox.
@@ -196,15 +405,26 @@ func mapError(err error) error {
 
 func toProtoSandbox(sb sandbox.Sandbox) *localv1.Sandbox {
 	return &localv1.Sandbox{
-		Id:            sb.ID,
-		Name:          sb.Name,
-		State:         sandboxState(sb.State),
-		Generation:    sb.Generation,
-		Image:         sb.Image,
-		Workspace:     sb.Workspace,
-		Error:         sb.Error,
-		CreatedAtUnix: unix(sb.CreatedAt),
-		UpdatedAtUnix: unix(sb.UpdatedAt),
+		Id:                 sb.ID,
+		Name:               sb.Name,
+		State:              sandboxState(sb.State),
+		Generation:         sb.Generation,
+		Image:              sb.Image,
+		Workspace:          sb.Workspace,
+		Error:              sb.Error,
+		CreatedAtUnix:      unix(sb.CreatedAt),
+		UpdatedAtUnix:      unix(sb.UpdatedAt),
+		Cpus:               sb.CPUs,
+		MemoryMib:          sb.MemoryMiB,
+		StoppedAtUnix:      unix(sb.StoppedAt),
+		Workspaces:         toProtoWorkspaces(sb.Workspaces),
+		Ports:              toProtoPorts(sb.Ports),
+		Allow:              toProtoRules(policyRules(sb.Policy, true)),
+		Deny:               toProtoRules(policyRules(sb.Policy, false)),
+		Agent:              metaAgent(sb),
+		Detached:           metaDetached(sb),
+		LastUsedAtUnix:     metaLastUsed(sb),
+		LastUsedAtUnixNano: metaLastUsedNano(sb),
 	}
 }
 
@@ -279,4 +499,96 @@ func operationState(v operation.State) localv1.OperationState {
 	default:
 		return localv1.OperationState_OPERATION_STATE_UNSPECIFIED
 	}
+}
+
+func toProtoWorkspaces(workspaces []sandbox.Workspace) []*localv1.Workspace {
+	out := make([]*localv1.Workspace, 0, len(workspaces))
+	for i := range workspaces {
+		out = append(out, &localv1.Workspace{Path: workspaces[i].Path, ReadOnly: workspaces[i].ReadOnly})
+	}
+	return out
+}
+
+func fromProtoWorkspaces(workspaces []*localv1.Workspace) []sandbox.Workspace {
+	out := make([]sandbox.Workspace, 0, len(workspaces))
+	for _, workspace := range workspaces {
+		if workspace == nil {
+			continue
+		}
+		out = append(out, sandbox.Workspace{Path: workspace.GetPath(), ReadOnly: workspace.GetReadOnly()})
+	}
+	return out
+}
+
+func toProtoPorts(ports []sandbox.Port) []*localv1.Port {
+	out := make([]*localv1.Port, 0, len(ports))
+	for i := range ports {
+		out = append(out, &localv1.Port{Host: uint32(ports[i].Host), Guest: uint32(ports[i].Guest), Protocol: ports[i].Protocol})
+	}
+	return out
+}
+
+func fromProtoPorts(ports []*localv1.Port) []sandbox.Port {
+	out := make([]sandbox.Port, 0, len(ports))
+	for _, port := range ports {
+		if port == nil || port.GetHost() > 65535 || port.GetGuest() > 65535 {
+			continue
+		}
+		out = append(out, sandbox.Port{Host: uint16(port.GetHost()), Guest: uint16(port.GetGuest()), Protocol: port.GetProtocol()}) //nolint:gosec // bounds checked above.
+	}
+	return out
+}
+
+func toProtoRules(rules []sandbox.NetworkRule) []*localv1.NetworkRule {
+	out := make([]*localv1.NetworkRule, 0, len(rules))
+	for i := range rules {
+		out = append(out, &localv1.NetworkRule{Protocol: rules[i].Protocol, Cidr: rules[i].CIDR, Port: uint32(rules[i].Port)})
+	}
+	return out
+}
+
+func fromProtoRules(rules []*localv1.NetworkRule) []sandbox.NetworkRule {
+	out := make([]sandbox.NetworkRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule == nil || rule.GetPort() > 65535 {
+			continue
+		}
+		out = append(out, sandbox.NetworkRule{Protocol: rule.GetProtocol(), CIDR: rule.GetCidr(), Port: uint16(rule.GetPort())}) //nolint:gosec // port is bounded to 65535 above.
+	}
+	return out
+}
+
+func policyRules(policy *sandbox.NetworkPolicy, allow bool) []sandbox.NetworkRule {
+	if policy == nil {
+		return nil
+	}
+	if allow {
+		return policy.Allow
+	}
+	return policy.Deny
+}
+
+func metaAgent(sb sandbox.Sandbox) string {
+	if sb.Meta == nil {
+		return ""
+	}
+	return sb.Meta.Agent
+}
+
+func metaDetached(sb sandbox.Sandbox) bool {
+	return sb.Meta != nil && sb.Meta.Detached
+}
+
+func metaLastUsed(sb sandbox.Sandbox) int64 {
+	if sb.Meta == nil {
+		return 0
+	}
+	return unix(sb.Meta.LastUsedAt)
+}
+
+func metaLastUsedNano(sb sandbox.Sandbox) int64 {
+	if sb.Meta == nil || sb.Meta.LastUsedAt.IsZero() {
+		return 0
+	}
+	return sb.Meta.LastUsedAt.UnixNano()
 }

@@ -5,10 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	gateway "github.com/KLORQ/sandboxes-gateway"
 	runtime "github.com/KLORQ/sandboxes-runtime"
@@ -16,6 +18,8 @@ import (
 
 	daemon "github.com/KLORQ/sandboxes-daemon"
 	daemonnetwork "github.com/KLORQ/sandboxes-daemon/internal/network"
+	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
+	"github.com/KLORQ/sandboxes-daemon/internal/service"
 	"github.com/KLORQ/sandboxes-daemon/internal/version"
 )
 
@@ -39,6 +43,12 @@ func main() {
 }
 
 func run() int {
+	if len(os.Args) > 1 && os.Args[1] == gateway.SupervisorArgument {
+		if err := gateway.RunSupervisor(os.Args[2:]); err != nil {
+			return 1
+		}
+		return 0
+	}
 	opts := parseOptions()
 	if opts.showVersion {
 		_, _ = fmt.Fprintln(os.Stdout, version.Version)
@@ -49,18 +59,17 @@ func run() int {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := daemon.Run(ctx, daemon.Config{
-		SocketPath:   opts.socketPath,
-		StateDir:     opts.stateDir,
-		Backend:      backend,
-		DefaultImage: opts.image,
-	}); err != nil {
+	err = daemon.Run(ctx, daemon.Config{
+		SocketPath:     opts.socketPath,
+		StateDir:       opts.stateDir,
+		Backend:        backend,
+		DefaultImage:   opts.image,
+		Cleanup:        cleanup,
+		OAuthProviders: dockerOAuthProviders(),
+	})
+	if err != nil {
 		slog.Error("daemon stopped", "error", err)
 		return 1
 	}
@@ -90,7 +99,22 @@ func parseOptions() options {
 	return opts
 }
 
-func buildBackend(opts options) (runtime.Backend, func(), error) {
+func dockerOAuthProviders() map[string]service.OAuthProvider {
+	provider, err := oauthsession.NewDockerHubProvider(http.DefaultTransport)
+	if err != nil {
+		slog.Error("Docker Hub OAuth provider configuration is invalid", "error", err)
+		return nil
+	}
+	return map[string]service.OAuthProvider{"docker": {
+		Device:         provider,
+		RevokeEndpoint: oauthsession.DockerOAuthRevokeURL,
+		DeviceHandoff: func(ctx context.Context, _ string, verificationURI string) error {
+			return oauthsession.OpenBrowser(ctx, verificationURI)
+		},
+	}}
+}
+
+func buildBackend(opts options) (runtime.Backend, func() error, error) {
 	if opts.containerdPath == "" {
 		return nil, nil, nil
 	}
@@ -114,10 +138,15 @@ func buildBackend(opts options) (runtime.Backend, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("create runtime backend: %w", err)
 	}
-	cleanup := func() {
+	cleanup := func() error {
 		if manager != nil {
-			_ = manager.Close(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := manager.Close(ctx); err != nil {
+				return fmt.Errorf("cleanup gateway manager: %w", err)
+			}
 		}
+		return nil
 	}
 	return backend, cleanup, nil
 }
@@ -130,8 +159,13 @@ func buildNetwork(opts options) (runtime.Network, *gateway.Manager, error) {
 	if runDir == "" {
 		runDir = filepath.Join(opts.stateDir, "run")
 	}
+	supervisor, err := os.Executable()
+	if err != nil {
+		return nil, nil, fmt.Errorf("locate gateway supervisor: %w", err)
+	}
 	manager, err := gateway.New(gateway.Config{
 		GVProxy:     opts.gvproxyPath,
+		Supervisor:  supervisor,
 		RunDir:      runDir,
 		DNSUpstream: opts.dnsUpstream,
 	})

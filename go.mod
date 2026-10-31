@@ -3,16 +3,20 @@ module github.com/KLORQ/sandboxes-daemon
 go 1.27
 
 require (
-	github.com/KLORQ/sandboxes-api v0.0.2
+	github.com/KLORQ/sandboxes-api v0.0.3
 	github.com/KLORQ/sandboxes-core v0.0.3
+	github.com/KLORQ/sandboxes-gateway v0.0.2
+	github.com/KLORQ/sandboxes-runtime v0.0.5
+	github.com/zalando/go-keyring v0.2.6
 	google.golang.org/grpc v1.85.0
 	modernc.org/sqlite v1.61.0
 )
 
 require (
-	github.com/KLORQ/sandboxes-gateway v0.0.2 // indirect
-	github.com/KLORQ/sandboxes-runtime v0.0.5 // indirect
+	al.essio.dev/pkg/shellescape v1.5.1 // indirect
+	github.com/danieljoos/wincred v1.2.2 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
