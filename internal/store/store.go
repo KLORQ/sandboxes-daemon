@@ -72,6 +72,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			allow_rules TEXT NOT NULL DEFAULT '[]',
 			deny_rules TEXT NOT NULL DEFAULT '[]',
 			agent TEXT NOT NULL DEFAULT '',
+			policy_profile TEXT NOT NULL DEFAULT '',
 			detached INTEGER NOT NULL DEFAULT 0,
 			last_used_at INTEGER NOT NULL DEFAULT 0,
 			cpus INTEGER NOT NULL DEFAULT 2,
@@ -95,6 +96,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS operations_idempotency
 			ON operations(idempotency_key) WHERE idempotency_key <> ''`,
 		`CREATE INDEX IF NOT EXISTS operations_sandbox ON operations(sandbox_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS registry_credential_index (
 			registry TEXT NOT NULL,
 			scope TEXT NOT NULL,
@@ -149,6 +155,7 @@ func (s *Store) ensureSandboxResourceColumns(ctx context.Context) error {
 		{"allow_rules", "allow_rules TEXT NOT NULL DEFAULT '[]'"},
 		{"deny_rules", "deny_rules TEXT NOT NULL DEFAULT '[]'"},
 		{"agent", "agent TEXT NOT NULL DEFAULT ''"},
+		{"policy_profile", "policy_profile TEXT NOT NULL DEFAULT ''"},
 		{"detached", "detached INTEGER NOT NULL DEFAULT 0"},
 		{"last_used_at", "last_used_at INTEGER NOT NULL DEFAULT 0"},
 	} {
@@ -176,11 +183,11 @@ func (s *Store) Create(ctx context.Context, sb sandbox.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	agent, detached, lastUsed := metaValues(sb)
+	agent, profile, detached, lastUsed := metaValues(sb)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO sandboxes
-		(id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error,
+		(id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, policy_profile, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, profile, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error,
 		toUnix(sb.CreatedAt), toUnix(sb.UpdatedAt))
 	return mapSQLError(err)
 }
@@ -198,11 +205,11 @@ func (s *Store) GetByName(ctx context.Context, name string) (sandbox.Sandbox, er
 func (s *Store) getSandbox(ctx context.Context, where string, arg any) (sandbox.Sandbox, error) {
 	var sb sandbox.Sandbox
 	var created, updated, stoppedAt int64
-	var workspaces, ports, allow, deny, agent string
+	var workspaces, ports, allow, deny, agent, profile string
 	var detached, lastUsed int64
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, policy_profile, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at
 		FROM sandboxes WHERE `+where, arg).Scan(
-		&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &workspaces, &ports, &allow, &deny, &agent, &detached, &lastUsed, &sb.CPUs, &sb.MemoryMiB, &stoppedAt, &sb.Error, &created, &updated)
+		&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &workspaces, &ports, &allow, &deny, &agent, &profile, &detached, &lastUsed, &sb.CPUs, &sb.MemoryMiB, &stoppedAt, &sb.Error, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sandbox.Sandbox{}, core.ErrNotFound
 	}
@@ -218,7 +225,7 @@ func (s *Store) getSandbox(ctx context.Context, where string, arg any) (sandbox.
 	if err := decodePolicy(allow, deny, &sb); err != nil {
 		return sandbox.Sandbox{}, err
 	}
-	decodeMeta(agent, detached, lastUsed, &sb)
+	decodeMeta(agent, profile, detached, lastUsed, &sb)
 	sb.StoppedAt = fromUnix(stoppedAt)
 	sb.CreatedAt = fromUnix(created)
 	sb.UpdatedAt = fromUnix(updated)
@@ -238,7 +245,7 @@ func (s *Store) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox.S
 	if err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, policy_profile, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at
 		FROM sandboxes ORDER BY created_at, id LIMIT ? OFFSET ?`, pageSize+1, offset)
 	if err != nil {
 		return nil, "", err
@@ -249,9 +256,9 @@ func (s *Store) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox.S
 	for rows.Next() {
 		var sb sandbox.Sandbox
 		var created, updated, stoppedAt int64
-		var workspaces, ports, allow, deny, agent string
+		var workspaces, ports, allow, deny, agent, profile string
 		var detached, lastUsed int64
-		if err := rows.Scan(&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &workspaces, &ports, &allow, &deny, &agent, &detached, &lastUsed, &sb.CPUs, &sb.MemoryMiB, &stoppedAt, &sb.Error, &created, &updated); err != nil {
+		if err := rows.Scan(&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &workspaces, &ports, &allow, &deny, &agent, &profile, &detached, &lastUsed, &sb.CPUs, &sb.MemoryMiB, &stoppedAt, &sb.Error, &created, &updated); err != nil {
 			return nil, "", err
 		}
 		if err := decodeWorkspaces(workspaces, &sb); err != nil {
@@ -263,7 +270,7 @@ func (s *Store) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox.S
 		if err := decodePolicy(allow, deny, &sb); err != nil {
 			return nil, "", err
 		}
-		decodeMeta(agent, detached, lastUsed, &sb)
+		decodeMeta(agent, profile, detached, lastUsed, &sb)
 		sb.StoppedAt = fromUnix(stoppedAt)
 		sb.CreatedAt = fromUnix(created)
 		sb.UpdatedAt = fromUnix(updated)
@@ -294,10 +301,10 @@ func (s *Store) Update(ctx context.Context, sb sandbox.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	agent, detached, lastUsed := metaValues(sb)
-	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET name=?, state=?, generation=?, image=?, workspace=?, workspaces=?, ports=?, allow_rules=?, deny_rules=?, agent=?, detached=?, last_used_at=?, cpus=?, memory_mib=?, stopped_at=?, error=?, updated_at=?
+	agent, profile, detached, lastUsed := metaValues(sb)
+	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET name=?, state=?, generation=?, image=?, workspace=?, workspaces=?, ports=?, allow_rules=?, deny_rules=?, agent=?, policy_profile=?, detached=?, last_used_at=?, cpus=?, memory_mib=?, stopped_at=?, error=?, updated_at=?
 		WHERE id=?`,
-		sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error, toUnix(sb.UpdatedAt), sb.ID)
+		sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, profile, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error, toUnix(sb.UpdatedAt), sb.ID)
 	if err != nil {
 		return mapSQLError(err)
 	}
@@ -447,11 +454,11 @@ func (s *Store) CreateSandboxWithOperation(ctx context.Context, sb sandbox.Sandb
 	if err != nil {
 		return err
 	}
-	agent, detached, lastUsed := metaValues(sb)
+	agent, profile, detached, lastUsed := metaValues(sb)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sandboxes
-		(id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error,
+		(id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, policy_profile, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, profile, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error,
 		toUnix(sb.CreatedAt), toUnix(sb.UpdatedAt)); err != nil {
 		return mapSQLError(err)
 	}
@@ -472,7 +479,7 @@ func (s *Store) ApplySandboxOperation(ctx context.Context, sb sandbox.Sandbox, o
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	agent, detached, lastUsed := metaValues(sb)
+	agent, _, detached, lastUsed := metaValues(sb)
 	res, err := tx.ExecContext(ctx, `UPDATE sandboxes SET state=?, generation=?, agent=?, detached=?, last_used_at=?, stopped_at=?, error=?, updated_at=? WHERE id=?`,
 		sb.State, sb.Generation, agent, detached, lastUsed, toUnix(sb.StoppedAt), sb.Error, toUnix(sb.UpdatedAt), sb.ID)
 	if err != nil {
@@ -661,22 +668,22 @@ func decodePolicy(allow, deny string, sb *sandbox.Sandbox) error {
 	return nil
 }
 
-func metaValues(sb sandbox.Sandbox) (string, int64, int64) {
+func metaValues(sb sandbox.Sandbox) (string, string, int64, int64) {
 	if sb.Meta == nil {
-		return "", 0, 0
+		return "", "", 0, 0
 	}
 	detached := int64(0)
 	if sb.Meta.Detached {
 		detached = 1
 	}
-	return sb.Meta.Agent, detached, toUnixNano(sb.Meta.LastUsedAt)
+	return sb.Meta.Agent, sb.Meta.PolicyProfile, detached, toUnixNano(sb.Meta.LastUsedAt)
 }
 
-func decodeMeta(agent string, detached, lastUsed int64, sb *sandbox.Sandbox) {
-	if agent == "" && detached == 0 && lastUsed == 0 {
+func decodeMeta(agent, profile string, detached, lastUsed int64, sb *sandbox.Sandbox) {
+	if agent == "" && profile == "" && detached == 0 && lastUsed == 0 {
 		return
 	}
-	sb.Meta = &sandbox.Meta{Agent: agent, Detached: detached != 0, LastUsedAt: fromUnixNano(lastUsed)}
+	sb.Meta = &sandbox.Meta{Agent: agent, PolicyProfile: profile, Detached: detached != 0, LastUsedAt: fromUnixNano(lastUsed)}
 }
 
 // RegistryCredentialIndex is non-secret metadata for a stored registry login.
@@ -725,4 +732,27 @@ func (s *Store) ListRegistryCredentialIndex(ctx context.Context) ([]RegistryCred
 		out = append(out, entry)
 	}
 	return out, rows.Err()
+}
+
+// GetSetting returns a daemon setting.
+func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", core.ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get setting: %w", err)
+	}
+	return value, nil
+}
+
+// SetSetting stores a daemon setting.
+func (s *Store) SetSetting(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`, key, value, time.Now().UTC().Unix())
+	if err != nil {
+		return fmt.Errorf("set setting: %w", err)
+	}
+	return nil
 }
