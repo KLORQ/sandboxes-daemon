@@ -46,6 +46,8 @@ type Service struct {
 	oauthVaultStore     oauthsession.Vault
 	dockerHubAuth       http.RoundTripper
 	DefaultImage        string
+	DefaultCPUs         uint32
+	DefaultMemoryMiB    uint32
 	now                 func() time.Time
 	createGates         [64]chan struct{}
 	lifecycleGates      [64]chan struct{}
@@ -518,13 +520,16 @@ func registryGateKey(registry string) string {
 
 // New creates a control-plane service.
 func New(st *store.Store, backend runtime.Backend) *Service {
+	cpus, memoryMiB := hostResourceDefaults()
 	s := &Service{
-		store:         st,
-		journal:       operation.NewJournal(st.Operations()),
-		backend:       backend,
-		DefaultImage:  "alpine:3.22",
-		now:           time.Now,
-		dockerHubAuth: oauthsession.NewDockerHubAuthTransport(),
+		store:            st,
+		journal:          operation.NewJournal(st.Operations()),
+		backend:          backend,
+		DefaultImage:     "alpine:3.22",
+		DefaultCPUs:      cpus,
+		DefaultMemoryMiB: memoryMiB,
+		now:              time.Now,
+		dockerHubAuth:    oauthsession.NewDockerHubAuthTransport(),
 	}
 	for i := range s.createGates {
 		s.createGates[i] = make(chan struct{}, 1)
@@ -646,7 +651,13 @@ func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uin
 	}
 	cpus, memoryMiB := req.CPUs, req.MemoryMiB
 	if cpus == 0 {
+		cpus = s.DefaultCPUs
+	}
+	if cpus == 0 {
 		cpus = 2
+	}
+	if memoryMiB == 0 {
+		memoryMiB = s.DefaultMemoryMiB
 	}
 	if memoryMiB == 0 {
 		memoryMiB = 1024

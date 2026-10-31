@@ -8,6 +8,7 @@ require (
 	github.com/KLORQ/sandboxes-gateway v0.0.3
 	github.com/KLORQ/sandboxes-runtime v0.0.8
 	github.com/zalando/go-keyring v0.2.6
+	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0
 	modernc.org/sqlite v1.61.0
 )
@@ -60,7 +61,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260825221802-da73d73af1c5 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
