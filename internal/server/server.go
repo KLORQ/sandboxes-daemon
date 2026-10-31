@@ -222,6 +222,7 @@ func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) 
 		Deny:           deny,
 		Agent:          req.GetAgent(),
 		Detached:       req.GetDetached(),
+		Env:            req.GetEnv(),
 	})
 	if err != nil {
 		return nil, mapError(err)
