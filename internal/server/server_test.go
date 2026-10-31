@@ -157,6 +157,14 @@ func TestGRPCLifecycle(t *testing.T) {
 	}
 }
 
+type emptyOAuthVault struct{}
+
+func (emptyOAuthVault) Set(context.Context, string, string, string) error { return nil }
+func (emptyOAuthVault) Get(context.Context, string, string) (string, error) {
+	return "", registrycredentials.ErrNotFound
+}
+func (emptyOAuthVault) Delete(context.Context, string, string) error { return nil }
+
 func TestAccountRPCFailsClosedWithoutTrustedProvider(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "account.db"))
@@ -166,7 +174,9 @@ func TestAccountRPCFailsClosedWithoutTrustedProvider(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
-	localv1.RegisterAccountServiceServer(grpcServer, NewAccount(service.New(st, nil)))
+	svc := service.New(st, nil)
+	svc.SetOAuthVault(emptyOAuthVault{})
+	localv1.RegisterAccountServiceServer(grpcServer, NewAccount(svc))
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 	conn, err := grpc.NewClient("passthrough:///bufnet",
