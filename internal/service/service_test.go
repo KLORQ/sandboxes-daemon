@@ -606,8 +606,8 @@ func TestCreatePassesResourceOverridesAndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	sb, err = svc.Get(ctx, op.SandboxID)
-	if err != nil || sb.CPUs != 2 || sb.MemoryMiB != 1024 {
-		t.Fatalf("defaults = %+v, %v", sb, err)
+	if err != nil || sb.CPUs != svc.DefaultCPUs || sb.MemoryMiB != svc.DefaultMemoryMiB {
+		t.Fatalf("defaults = %+v, %v (want %d CPU/%d MiB)", sb, err, svc.DefaultCPUs, svc.DefaultMemoryMiB)
 	}
 	for _, req := range []CreateRequest{{Name: "bad-cpu", CPUs: 65}, {Name: "bad-memory", MemoryMiB: 64}} {
 		if _, err := svc.Create(ctx, req); err == nil {
