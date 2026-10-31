@@ -546,14 +546,15 @@ type CreateRequest struct {
 	Workspace      string
 	IdempotencyKey string
 	// Zero selects the daemon default.
-	CPUs       uint32
-	MemoryMiB  uint32
-	Workspaces []sandbox.Workspace
-	Ports      []sandbox.Port
-	Allow      []sandbox.NetworkRule
-	Deny       []sandbox.NetworkRule
-	Agent      string
-	Detached   bool
+	CPUs          uint32
+	MemoryMiB     uint32
+	Workspaces    []sandbox.Workspace
+	Ports         []sandbox.Port
+	Allow         []sandbox.NetworkRule
+	Deny          []sandbox.NetworkRule
+	Agent         string
+	Detached      bool
+	PolicyProfile string
 	// Env is baked into the sandbox runtime; it is never written to SQLite.
 	Env map[string]string
 }
@@ -577,7 +578,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	ports, allow, deny, err := normalizeCreateNetwork(req)
+	profile, ports, allow, deny, err := s.normalizeCreatePolicy(ctx, req)
 	if err != nil {
 		return operation.Operation{}, err
 	}
@@ -627,7 +628,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		}
 		state = sandbox.Running
 	}
-	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, cpus, memoryMiB, now)
+	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, profile, cpus, memoryMiB, now)
 	op := operation.Operation{
 		ID:             opID,
 		SandboxID:      sbID,
@@ -683,7 +684,7 @@ func normalizeCreateWorkspaces(req CreateRequest) (string, []sandbox.Workspace, 
 	return workspaces[0].Path, workspaces, nil
 }
 
-func newSandboxRecord(id, name string, state sandbox.State, image, workspace string, workspaces []sandbox.Workspace, ports []sandbox.Port, allow, deny []sandbox.NetworkRule, agent string, detached bool, cpus, memoryMiB uint32, now time.Time) sandbox.Sandbox {
+func newSandboxRecord(id, name string, state sandbox.State, image, workspace string, workspaces []sandbox.Workspace, ports []sandbox.Port, allow, deny []sandbox.NetworkRule, agent string, detached bool, profile string, cpus, memoryMiB uint32, now time.Time) sandbox.Sandbox {
 	stoppedAt := time.Time{}
 	if state == sandbox.Stopped {
 		stoppedAt = now
@@ -691,7 +692,7 @@ func newSandboxRecord(id, name string, state sandbox.State, image, workspace str
 	return sandbox.Sandbox{
 		ID: id, Name: name, State: state, Generation: 1, Image: image,
 		Workspace: workspace, Workspaces: workspaces, Ports: ports, Policy: networkPolicy(allow, deny),
-		Meta: &sandbox.Meta{Agent: agent, Detached: detached, LastUsedAt: now},
+		Meta: &sandbox.Meta{Agent: agent, Detached: detached, PolicyProfile: profile, LastUsedAt: now},
 		CPUs: cpus, MemoryMiB: memoryMiB, StoppedAt: stoppedAt, CreatedAt: now, UpdatedAt: now,
 	}
 }
@@ -832,7 +833,7 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 		if rule.Protocol == "" {
 			rule.Protocol = tcpProtocol
 		}
-		if rule.Protocol != tcpProtocol && rule.Protocol != "udp" {
+		if rule.Protocol != tcpProtocol && rule.Protocol != udpProtocol {
 			return nil, fmt.Errorf("%w: network rule protocol must be tcp or udp", core.ErrConflict)
 		}
 		ip, _, err := net.ParseCIDR(rule.CIDR)
@@ -1040,6 +1041,106 @@ func createEnvNameStart(c byte) bool {
 
 func createEnvNameChar(c byte) bool {
 	return createEnvNameStart(c) || (c >= '0' && c <= '9')
+}
+
+const (
+	policyProfileSetting  = "policy.profile"
+	policyProfileDenyAll  = "deny-all"
+	policyProfileBalanced = "balanced"
+	policyProfileAllowAll = "allow-all"
+	anyIPv4CIDR           = "0.0.0.0/0"
+)
+
+func (s *Service) normalizeCreatePolicy(ctx context.Context, req CreateRequest) (string, []sandbox.Port, []sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	ports, allow, deny, err := normalizeCreateNetwork(req)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	profile, rules, err := s.resolveCreateProfile(ctx, req.PolicyProfile)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	return profile, ports, mergePolicyRules(rules, allow), deny, nil
+}
+
+// GetPolicyProfile returns the global default profile for new sandboxes.
+func (s *Service) GetPolicyProfile(ctx context.Context) (string, error) {
+	profile, err := s.store.GetSetting(ctx, policyProfileSetting)
+	if errors.Is(err, core.ErrNotFound) {
+		return policyProfileDenyAll, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if profile == "" {
+		return policyProfileDenyAll, nil
+	}
+	return profile, nil
+}
+
+// SetPolicyProfile stores the global default profile for new sandboxes.
+func (s *Service) SetPolicyProfile(ctx context.Context, profile string) (string, error) {
+	profile, _, err := normalizePolicyProfile(profile)
+	if err != nil {
+		return "", err
+	}
+	if err := s.store.SetSetting(ctx, policyProfileSetting, profile); err != nil {
+		return "", err
+	}
+	return profile, nil
+}
+
+func (s *Service) resolveCreateProfile(ctx context.Context, requested string) (string, []sandbox.NetworkRule, error) {
+	profile := requested
+	if profile == "" {
+		var err error
+		profile, err = s.GetPolicyProfile(ctx)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	normalized, rules, err := normalizePolicyProfile(profile)
+	if err != nil {
+		return "", nil, err
+	}
+	return normalized, rules, nil
+}
+
+func normalizePolicyProfile(profile string) (string, []sandbox.NetworkRule, error) {
+	switch profile {
+	case "", policyProfileDenyAll:
+		return policyProfileDenyAll, nil, nil
+	case policyProfileAllowAll, "sbx-compat":
+		return policyProfileAllowAll, []sandbox.NetworkRule{
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR},
+			{Protocol: "udp", CIDR: anyIPv4CIDR},
+		}, nil
+	case policyProfileBalanced:
+		return policyProfileBalanced, []sandbox.NetworkRule{
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR, Port: 80},
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR, Port: 443},
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR, Port: 53},
+			{Protocol: "udp", CIDR: anyIPv4CIDR, Port: 53},
+		}, nil
+	default:
+		return "", nil, fmt.Errorf("%w: unknown policy profile", core.ErrConflict)
+	}
+}
+
+func mergePolicyRules(profile, explicit []sandbox.NetworkRule) []sandbox.NetworkRule {
+	out := append([]sandbox.NetworkRule(nil), profile...)
+	seen := make(map[sandbox.NetworkRule]struct{}, len(out))
+	for _, rule := range out {
+		seen[rule] = struct{}{}
+	}
+	for _, rule := range explicit {
+		if _, exists := seen[rule]; exists {
+			continue
+		}
+		seen[rule] = struct{}{}
+		out = append(out, rule)
+	}
+	return out
 }
 
 type createIntent struct {

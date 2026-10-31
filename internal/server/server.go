@@ -222,6 +222,7 @@ func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) 
 		Deny:           deny,
 		Agent:          req.GetAgent(),
 		Detached:       req.GetDetached(),
+		PolicyProfile:  req.GetPolicyProfile(),
 		Env:            req.GetEnv(),
 	})
 	if err != nil {
@@ -387,6 +388,24 @@ func (s *OperationServer) Wait(ctx context.Context, req *localv1.OperationServic
 	return &localv1.OperationServiceWaitResponse{Operation: toProtoOperation(op)}, nil
 }
 
+// GetPolicyProfile returns the global default profile for new sandboxes.
+func (s *SandboxServer) GetPolicyProfile(ctx context.Context, _ *localv1.GetPolicyProfileRequest) (*localv1.GetPolicyProfileResponse, error) {
+	profile, err := s.svc.GetPolicyProfile(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &localv1.GetPolicyProfileResponse{Profile: profile}, nil
+}
+
+// SetPolicyProfile sets the global default profile for new sandboxes.
+func (s *SandboxServer) SetPolicyProfile(ctx context.Context, req *localv1.SetPolicyProfileRequest) (*localv1.SetPolicyProfileResponse, error) {
+	profile, err := s.svc.SetPolicyProfile(ctx, req.GetProfile())
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &localv1.SetPolicyProfileResponse{Profile: profile}, nil
+}
+
 func mapError(err error) error {
 	switch {
 	case err == nil:
@@ -424,6 +443,7 @@ func toProtoSandbox(sb sandbox.Sandbox) *localv1.Sandbox {
 		Deny:               toProtoRules(policyRules(sb.Policy, false)),
 		Agent:              metaAgent(sb),
 		Detached:           metaDetached(sb),
+		PolicyProfile:      metaPolicyProfile(sb),
 		LastUsedAtUnix:     metaLastUsed(sb),
 		LastUsedAtUnixNano: metaLastUsedNano(sb),
 	}
@@ -567,6 +587,13 @@ func policyRules(policy *sandbox.NetworkPolicy, allow bool) []sandbox.NetworkRul
 		return policy.Allow
 	}
 	return policy.Deny
+}
+
+func metaPolicyProfile(sb sandbox.Sandbox) string {
+	if sb.Meta == nil {
+		return ""
+	}
+	return sb.Meta.PolicyProfile
 }
 
 func metaAgent(sb sandbox.Sandbox) string {

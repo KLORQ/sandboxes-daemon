@@ -1082,3 +1082,40 @@ func TestRegistryCredentialListAndSandboxCleanup(t *testing.T) {
 		t.Fatalf("items after delete=%+v err=%v", items, err)
 	}
 }
+
+func TestPolicyProfileGlobalAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "profiles.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	if profile, err := svc.GetPolicyProfile(ctx); err != nil || profile != "deny-all" {
+		t.Fatalf("default profile=%q err=%v", profile, err)
+	}
+	if profile, err := svc.SetPolicyProfile(ctx, "balanced"); err != nil || profile != "balanced" {
+		t.Fatalf("set profile=%q err=%v", profile, err)
+	}
+	op, err := svc.Create(ctx, CreateRequest{Name: "profile-default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := svc.Get(ctx, op.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Meta == nil || sb.Meta.PolicyProfile != "balanced" {
+		t.Fatalf("metadata=%+v", sb.Meta)
+	}
+	if len(backend.lastConfig.Allow) != 4 {
+		t.Fatalf("profile rules=%+v", backend.lastConfig.Allow)
+	}
+	if profile, err := svc.SetPolicyProfile(ctx, "sbx-compat"); err != nil || profile != "allow-all" {
+		t.Fatalf("alias profile=%q err=%v", profile, err)
+	}
+	if _, err := svc.SetPolicyProfile(ctx, "unknown"); err == nil {
+		t.Fatal("unknown profile accepted")
+	}
+}
