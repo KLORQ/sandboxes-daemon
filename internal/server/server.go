@@ -8,6 +8,7 @@ import (
 	"time"
 
 	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	apiversion "github.com/KLORQ/sandboxes-api/version"
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
+	"github.com/KLORQ/sandboxes-daemon/internal/version"
 )
 
 // SandboxServer implements the sandbox gRPC service.
@@ -45,6 +47,14 @@ type AccountServer struct {
 
 // NewSandbox creates a sandbox gRPC service.
 func NewSandbox(svc *service.Service) *SandboxServer { return &SandboxServer{svc: svc} }
+
+// GetVersion reports the daemon and API contract versions.
+func (s *SandboxServer) GetVersion(context.Context, *localv1.GetVersionRequest) (*localv1.GetVersionResponse, error) {
+	return &localv1.GetVersionResponse{
+		Version:    version.Version,
+		ApiVersion: apiversion.Version,
+	}, nil
+}
 
 // NewOperation creates an operation gRPC service.
 func NewOperation(svc *service.Service) *OperationServer { return &OperationServer{svc: svc} }
