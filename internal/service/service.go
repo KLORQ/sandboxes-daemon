@@ -4,37 +4,533 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"net"
+	"net/http"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
 	runtime "github.com/KLORQ/sandboxes-runtime"
 
+	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
+	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
+)
+
+const (
+	tcpProtocol = "tcp"
+	udpProtocol = "udp"
 )
 
 // Service coordinates durable sandbox state and operations.
 type Service struct {
-	store        *store.Store
-	journal      *operation.Journal
-	backend      runtime.Backend
-	DefaultImage string
-	now          func() time.Time
+	store               *store.Store
+	journal             *operation.Journal
+	backend             runtime.Backend
+	registryCredentials *registrycredentials.Store
+	oauthProviders      map[string]OAuthProvider
+	oauthVaultStore     oauthsession.Vault
+	dockerHubAuth       http.RoundTripper
+	DefaultImage        string
+	now                 func() time.Time
+	createGates         [64]chan struct{}
+	lifecycleGates      [64]chan struct{}
+	credentialGates     [64]chan struct{}
+	execMu              sync.Mutex
+	execSessions        map[string]map[*execSession]struct{}
+}
+
+const dockerHubRegistry = "docker.io"
+
+// OAuthProvider contains trusted, daemon-side OAuth configuration. Never
+// populate it from an RPC request, guest, workspace, or sandbox metadata.
+type OAuthProvider struct {
+	Config         oauthsession.Provider
+	Device         oauthsession.DeviceProvider
+	RevokeEndpoint string
+	OpenBrowser    func(context.Context, string) error
+	DeviceHandoff  func(context.Context, string, string) error
+}
+
+// SetOAuthProviders installs an immutable snapshot of trusted provider config.
+func (s *Service) SetOAuthProviders(providers map[string]OAuthProvider) {
+	copyOf := make(map[string]OAuthProvider, len(providers))
+	for name := range providers {
+		provider := providers[name]
+		provider.Config.Scopes = append([]string(nil), provider.Config.Scopes...)
+		provider.Device.Scopes = append([]string(nil), provider.Device.Scopes...)
+		copyOf[name] = provider
+	}
+	s.oauthProviders = copyOf
+}
+
+// SetOAuthVault injects the host credential vault. Production defaults to the
+// native OS keychain; this hook supports controlled provider tests.
+func (s *Service) SetOAuthVault(vault oauthsession.Vault) { s.oauthVaultStore = vault }
+
+// LoginAccount performs a browser-based host OAuth flow for a registered provider.
+func (s *Service) LoginAccount(ctx context.Context, name string) error {
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(name))
+	if err != nil {
+		return err
+	}
+	defer release()
+	provider, ok := s.oauthProviders[name]
+	if !ok {
+		return ErrOAuthProviderUnavailable
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("OAuth login requires a bounded context")
+	}
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
+	if err != nil {
+		return errors.New("OAuth host keychain is unavailable")
+	}
+	if err := s.checkAccountLoginAvailable(ctx, name, sink); err != nil {
+		return err
+	}
+	if provider.Device.ClientID != "" {
+		return s.authorizeDeviceAccount(ctx, provider, sink)
+	}
+	if provider.OpenBrowser == nil || provider.Config.Transport == nil {
+		return ErrOAuthProviderUnavailable
+	}
+	return oauthsession.Authorize(ctx, provider.Config, provider.OpenBrowser, sink)
+}
+
+func (s *Service) checkAccountLoginAvailable(ctx context.Context, name string, sink *oauthsession.VaultSink) error {
+	if name == "docker" {
+		return s.checkDockerHubLoginAvailable(ctx, sink)
+	}
+	if _, _, err := sink.Load(ctx); err == nil {
+		return ErrOAuthCredentialConflict
+	} else if !errors.Is(err, oauthsession.ErrNoTokens) {
+		return errors.New("inspect existing OAuth account credentials failed")
+	}
+	return nil
+}
+
+func (s *Service) authorizeDeviceAccount(ctx context.Context, provider OAuthProvider, sink *oauthsession.VaultSink) error {
+	if provider.DeviceHandoff == nil || provider.Device.PATEndpoint == "" || s.registryCredentials == nil || !oauthsession.SameHTTPSOrigin(provider.Device.Audience, provider.Device.PATEndpoint) {
+		return ErrOAuthProviderUnavailable
+	}
+	combined := dockerAccountSink{oauth: sink, registry: s.registryCredentials, provider: provider.Device}
+	return oauthsession.AuthorizeDevice(ctx, provider.Device, provider.DeviceHandoff, combined)
+}
+
+// LogoutAccount deletes the local host token record and revokes the upstream
+// refresh token when the trusted provider configuration supports revocation.
+func (s *Service) LogoutAccount(ctx context.Context, name string) (bool, error) {
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(name))
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
+	if err != nil {
+		return false, errors.New("OAuth host keychain is unavailable")
+	}
+	tokens, hasTokens, err := loadAccountTokens(ctx, sink)
+	if err != nil {
+		return false, err
+	}
+	fingerprint, hasFingerprint, err := loadAccountFingerprint(ctx, sink)
+	if err != nil {
+		return false, err
+	}
+	if !hasTokens && !hasFingerprint {
+		return false, nil
+	}
+	var revokeErr error
+	if hasTokens && tokens.RefreshToken != "" {
+		revokeErr = s.revokeAccountRefreshToken(ctx, name, tokens.RefreshToken)
+		if revokeErr != nil && !errors.Is(revokeErr, ErrOAuthRevocationUnavailable) {
+			return true, revokeErr
+		}
+	}
+	if err := deleteAccountTokens(ctx, sink, hasTokens); err != nil {
+		return false, err
+	}
+	if hasFingerprint {
+		if err := s.removeOAuthOwnedDockerHubCredentials(ctx, fingerprint); err != nil {
+			return true, err
+		}
+		if err := sink.DeleteDockerHubPATFingerprint(ctx); err != nil {
+			return true, err
+		}
+	}
+	return true, revokeErr
+}
+
+func loadAccountTokens(ctx context.Context, sink *oauthsession.VaultSink) (oauthsession.Tokens, bool, error) {
+	tokens, _, err := sink.Load(ctx)
+	if errors.Is(err, oauthsession.ErrNoTokens) {
+		return oauthsession.Tokens{}, false, nil
+	}
+	if err != nil {
+		return oauthsession.Tokens{}, false, err
+	}
+	return tokens, true, nil
+}
+
+func loadAccountFingerprint(ctx context.Context, sink *oauthsession.VaultSink) (string, bool, error) {
+	fingerprint, err := sink.DockerHubPATFingerprint(ctx)
+	if errors.Is(err, oauthsession.ErrNoCredentialFingerprint) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return fingerprint, true, nil
+}
+
+func deleteAccountTokens(ctx context.Context, sink *oauthsession.VaultSink, present bool) error {
+	if present {
+		return sink.Delete(ctx)
+	}
+	return nil
+}
+
+func (s *Service) removeOAuthOwnedDockerHubCredentials(ctx context.Context, fingerprint string) error {
+	if s.registryCredentials == nil {
+		return errors.New("local Docker Hub credential store is unavailable")
+	}
+	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
+		if err := s.removeCredentialIfFingerprintMatches(ctx, scope, fingerprint); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) removeCredentialIfFingerprintMatches(ctx context.Context, scope registrycredentials.Scope, fingerprint string) error {
+	credential, err := s.registryCredentials.Load(ctx, dockerHubRegistry, scope, "")
+	if errors.Is(err, registrycredentials.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("local Docker Hub credentials were only partially removed")
+	}
+	hash := sha256.Sum256(credential.Password)
+	clear(credential.Password)
+	actual := hex.EncodeToString(hash[:])
+	if subtle.ConstantTimeCompare([]byte(actual), []byte(fingerprint)) != 1 {
+		return nil
+	}
+	if _, err := s.registryCredentials.Delete(ctx, dockerHubRegistry, scope, ""); err != nil {
+		return errors.New("local Docker Hub credentials were only partially removed")
+	}
+	return nil
+}
+
+func (s *Service) revokeAccountRefreshToken(ctx context.Context, name, refreshToken string) error {
+	provider, configured := s.oauthProviders[name]
+	if !configured || provider.RevokeEndpoint == "" {
+		return ErrOAuthRevocationUnavailable
+	}
+	transport, clientID := provider.Config.Transport, provider.Config.ClientID
+	if provider.Device.Transport != nil {
+		transport, clientID = provider.Device.Transport, provider.Device.ClientID
+	}
+	if err := oauthsession.Revoke(ctx, transport, provider.RevokeEndpoint, clientID, refreshToken); err != nil {
+		return ErrOAuthRevocationFailed
+	}
+	return nil
+}
+
+type dockerAccountSink struct {
+	oauth    *oauthsession.VaultSink
+	registry *registrycredentials.Store
+	provider oauthsession.DeviceProvider
+}
+
+func (s dockerAccountSink) Save(ctx context.Context, tokens oauthsession.Tokens) error {
+	username, err := oauthsession.HubUsernameFromAccessToken(tokens.AccessToken)
+	if err != nil {
+		return err
+	}
+	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
+		existing, loadErr := s.registry.Load(ctx, dockerHubRegistry, scope, "")
+		if loadErr == nil {
+			clear(existing.Password)
+			return ErrOAuthCredentialConflict
+		}
+		if !errors.Is(loadErr, registrycredentials.ErrNotFound) {
+			return errors.New("inspect existing Docker Hub credentials failed")
+		}
+	}
+	if err := s.oauth.Save(ctx, tokens); err != nil {
+		return err
+	}
+	pat, err := oauthsession.GeneratePAT(ctx, s.provider.Transport, s.provider.PATEndpoint, tokens.AccessToken)
+	if err != nil {
+		return oauthsession.ErrOAuthPartialLogin
+	}
+	password := []byte(pat)
+	defer clear(password)
+	hash := sha256.Sum256(password)
+	if err := s.oauth.SaveDockerHubPATFingerprint(ctx, hex.EncodeToString(hash[:])); err != nil {
+		return oauthsession.ErrOAuthPartialLogin
+	}
+	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
+		if _, err := s.registry.Save(ctx, registrycredentials.Credential{Registry: dockerHubRegistry, Username: username, Password: password, Scope: scope}); err != nil {
+			return oauthsession.ErrOAuthPartialLogin
+		}
+	}
+	return nil
+}
+
+func (s *Service) oauthVault() oauthsession.Vault {
+	if s.oauthVaultStore != nil {
+		return s.oauthVaultStore
+	}
+	return registrycredentials.NativeVault{}
+}
+
+var ErrOAuthProviderUnavailable = errors.New("OAuth provider is not configured")
+var ErrOAuthCredentialConflict = oauthsession.ErrCredentialConflict
+var ErrOAuthPartialLogin = oauthsession.ErrOAuthPartialLogin
+var ErrDockerHubCredentialRejected = oauthsession.ErrDockerHubCredentialRejected
+var ErrOAuthRevocationFailed = errors.New("OAuth credentials were removed locally but provider revocation failed")
+var ErrOAuthRevocationUnavailable = errors.New("OAuth credentials were removed locally but provider revocation is not configured")
+
+// SetRegistryCredentialStore configures host-keychain storage for registry logins.
+func (s *Service) SetRegistryCredentialStore(credentialStore *registrycredentials.Store) {
+	s.registryCredentials = credentialStore
+}
+
+// SetDockerHubAuthTransport injects the HTTP transport used only to validate
+// Docker Hub username/PAT login. Production uses a direct TLS transport.
+func (s *Service) SetDockerHubAuthTransport(transport http.RoundTripper) {
+	s.dockerHubAuth = transport
+}
+
+// LoginDockerHubPAT verifies a Docker Hub username/PAT pair, then stores the
+// PAT in the host-only and all-sandboxes vault scopes for registry use.
+func (s *Service) LoginDockerHubPAT(ctx context.Context, username string, password []byte) error {
+	defer clear(password)
+	if s.registryCredentials == nil || s.dockerHubAuth == nil {
+		return errors.New("docker Hub credential services are unavailable")
+	}
+	if !validDockerHubPATInput(username, password) {
+		return registrycredentials.ErrInvalidCredential
+	}
+	release, err := s.acquireCredentialGate(ctx, accountGateKey("docker"))
+	if err != nil {
+		return err
+	}
+	defer release()
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), "docker")
+	if err != nil {
+		return errors.New("docker account host keychain is unavailable")
+	}
+	if err := s.checkDockerHubLoginAvailable(ctx, sink); err != nil {
+		return err
+	}
+	if err := oauthsession.ValidateDockerHubCredentials(ctx, s.dockerHubAuth, username, password); err != nil {
+		return err
+	}
+	return s.persistDockerHubPAT(ctx, sink, username, password)
+}
+
+func validDockerHubPATInput(username string, password []byte) bool {
+	return username != "" && len(username) <= 255 && strings.TrimSpace(username) == username && !strings.ContainsAny(username, "\x00\r\n") &&
+		len(password) > 0 && len(password) <= 2048 && utf8.Valid(password)
+}
+
+func (s *Service) persistDockerHubPAT(ctx context.Context, sink *oauthsession.VaultSink, username string, password []byte) error {
+	hash := sha256.Sum256(password)
+	if err := sink.SaveDockerHubPATFingerprint(ctx, hex.EncodeToString(hash[:])); err != nil {
+		return oauthsession.ErrOAuthPartialLogin
+	}
+	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
+		if _, err := s.registryCredentials.Save(ctx, registrycredentials.Credential{
+			Registry: dockerHubRegistry, Username: username, Password: password, Scope: scope,
+		}); err != nil {
+			return oauthsession.ErrOAuthPartialLogin
+		}
+	}
+	return nil
+}
+
+func (s *Service) checkDockerHubLoginAvailable(ctx context.Context, sink *oauthsession.VaultSink) error {
+	if s.registryCredentials == nil {
+		return errors.New("docker Hub credential services are unavailable")
+	}
+	if _, _, err := sink.Load(ctx); err == nil {
+		return ErrOAuthCredentialConflict
+	} else if !errors.Is(err, oauthsession.ErrNoTokens) {
+		return errors.New("inspect existing Docker account credentials failed")
+	}
+	if _, err := sink.DockerHubPATFingerprint(ctx); err == nil {
+		return ErrOAuthCredentialConflict
+	} else if !errors.Is(err, oauthsession.ErrNoCredentialFingerprint) {
+		return errors.New("inspect existing Docker account ownership failed")
+	}
+	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
+		credential, err := s.registryCredentials.Load(ctx, dockerHubRegistry, scope, "")
+		if err == nil {
+			clear(credential.Password)
+			return ErrOAuthCredentialConflict
+		}
+		if !errors.Is(err, registrycredentials.ErrNotFound) {
+			return errors.New("inspect existing Docker Hub credentials failed")
+		}
+	}
+	return nil
+}
+
+// LoginRegistry stores registry credentials on the host and returns safe metadata.
+func (s *Service) LoginRegistry(ctx context.Context, credential registrycredentials.Credential) (registrycredentials.Summary, error) {
+	if s.registryCredentials == nil {
+		return registrycredentials.Summary{}, fmt.Errorf("host registry credential store is unavailable")
+	}
+	release, err := s.acquireCredentialGate(ctx, registryGateKey(credential.Registry))
+	if err != nil {
+		return registrycredentials.Summary{}, err
+	}
+	defer release()
+	summary, err := s.registryCredentials.Save(ctx, credential)
+	if err != nil {
+		return registrycredentials.Summary{}, err
+	}
+	if err := s.store.UpsertRegistryCredentialIndex(ctx, store.RegistryCredentialIndex{
+		Registry: summary.Registry, Username: summary.Username, Scope: string(summary.Scope), SandboxName: summary.SandboxName,
+	}); err != nil {
+		_, _ = s.registryCredentials.Delete(ctx, summary.Registry, summary.Scope, summary.SandboxName)
+		return registrycredentials.Summary{}, err
+	}
+	return summary, nil
+}
+
+// LogoutRegistry removes a scoped registry login from the host keychain.
+func (s *Service) LogoutRegistry(ctx context.Context, registry string, scope registrycredentials.Scope, sandboxName string) (bool, error) {
+	if s.registryCredentials == nil {
+		return false, fmt.Errorf("host registry credential store is unavailable")
+	}
+	release, err := s.acquireCredentialGate(ctx, registryGateKey(registry))
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	canonical := registry
+	if loaded, loadErr := s.registryCredentials.Load(ctx, registry, scope, sandboxName); loadErr == nil {
+		canonical = loaded.Registry
+		clear(loaded.Password)
+	}
+	removed, err := s.registryCredentials.Delete(ctx, registry, scope, sandboxName)
+	if err != nil || !removed {
+		return removed, err
+	}
+	if err := s.store.DeleteRegistryCredentialIndex(ctx, canonical, string(scope), sandboxName); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// ListRegistryCredentials returns non-secret summaries of stored registry logins.
+func (s *Service) ListRegistryCredentials(ctx context.Context) ([]registrycredentials.Summary, error) {
+	entries, err := s.store.ListRegistryCredentialIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]registrycredentials.Summary, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, registrycredentials.Summary{
+			Registry: entry.Registry, Username: entry.Username,
+			Scope: registrycredentials.Scope(entry.Scope), SandboxName: entry.SandboxName,
+		})
+	}
+	return out, nil
+}
+
+func (s *Service) cleanupSandboxRegistryCredentials(ctx context.Context, sandboxName string) error {
+	if s.registryCredentials == nil {
+		return nil
+	}
+	if err := s.deleteSandboxRegistryCredentials(ctx, sandboxName); err != nil {
+		return fmt.Errorf("remove sandbox registry credentials: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) deleteSandboxRegistryCredentials(ctx context.Context, sandboxName string) error {
+	entries, err := s.store.ListRegistryCredentialIndex(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, entry := range entries {
+		if entry.Scope != string(registrycredentials.ScopeSandbox) || entry.SandboxName != sandboxName {
+			continue
+		}
+		if _, err := s.registryCredentials.Delete(ctx, entry.Registry, registrycredentials.ScopeSandbox, sandboxName); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if err := s.store.DeleteRegistryCredentialIndex(ctx, entry.Registry, entry.Scope, entry.SandboxName); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (s *Service) acquireCredentialGate(ctx context.Context, key string) (func(), error) {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(key))
+	gate := s.credentialGates[hash.Sum64()%uint64(len(s.credentialGates))]
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func accountGateKey(provider string) string {
+	if provider == "docker" {
+		return "registry/docker.io"
+	}
+	return "oauth/" + provider
+}
+
+func registryGateKey(registry string) string {
+	host := strings.ToLower(strings.TrimSpace(registry))
+	if host == "" || host == "docker.io" || host == "index.docker.io" {
+		return "registry/docker.io"
+	}
+	return "registry/" + host
 }
 
 // New creates a control-plane service.
 func New(st *store.Store, backend runtime.Backend) *Service {
-	return &Service{
-		store:        st,
-		journal:      operation.NewJournal(st.Operations()),
-		backend:      backend,
-		DefaultImage: "alpine:3.22",
-		now:          time.Now,
+	s := &Service{
+		store:         st,
+		journal:       operation.NewJournal(st.Operations()),
+		backend:       backend,
+		DefaultImage:  "alpine:3.22",
+		now:           time.Now,
+		dockerHubAuth: oauthsession.NewDockerHubAuthTransport(),
 	}
+	for i := range s.createGates {
+		s.createGates[i] = make(chan struct{}, 1)
+		s.lifecycleGates[i] = make(chan struct{}, 1)
+		s.credentialGates[i] = make(chan struct{}, 1)
+	}
+	return s
 }
 
 // CreateRequest describes a new sandbox.
@@ -43,16 +539,55 @@ type CreateRequest struct {
 	Image          string
 	Workspace      string
 	IdempotencyKey string
+	// Zero selects the daemon default.
+	CPUs       uint32
+	MemoryMiB  uint32
+	Workspaces []sandbox.Workspace
+	Ports      []sandbox.Port
+	Allow      []sandbox.NetworkRule
+	Deny       []sandbox.NetworkRule
+	Agent      string
+	Detached   bool
 }
 
 // Create creates a stopped sandbox and a completed create operation.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Operation, error) {
 	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		return operation.Operation{}, fmt.Errorf("%w: name is required", core.ErrConflict)
+	if !validSandboxName(name) {
+		return operation.Operation{}, fmt.Errorf("%w: invalid sandbox name", core.ErrConflict)
 	}
-	if len(name) > 63 {
-		return operation.Operation{}, fmt.Errorf("%w: name is too long", core.ErrConflict)
+	release, err := s.acquireCreateGates(ctx, name, req.IdempotencyKey)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	defer release()
+	image, cpus, memoryMiB, err := s.resolveCreateResources(req)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	workspace, workspaces, err := normalizeCreateWorkspaces(req)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	ports, allow, deny, err := normalizeCreateNetwork(req)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	intent := createIntent{
+		name: name, image: image, workspace: workspace, workspaces: workspaces, ports: ports,
+		allow: allow, deny: deny, agent: req.Agent, detached: req.Detached, cpus: cpus, memoryMiB: memoryMiB,
+	}
+	if req.IdempotencyKey != "" {
+		existing, err := s.replayCreate(ctx, req.IdempotencyKey, intent)
+		if err == nil {
+			return existing, nil
+		}
+		if !errors.Is(err, core.ErrNotFound) {
+			return operation.Operation{}, err
+		}
+	}
+	if err := s.ensureNameAvailable(ctx, name); err != nil {
+		return operation.Operation{}, err
 	}
 	now := s.now().UTC()
 	sbID, err := newID("sb")
@@ -63,36 +598,27 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	image := req.Image
-	if image == "" {
-		image = s.DefaultImage
-	}
 	state := sandbox.Stopped
 	var handle runtime.Handle
 	if s.backend != nil {
 		var err error
 		handle, err = s.backend.Create(ctx, runtime.Config{
-			Name:      name,
-			Image:     image,
-			Workspace: req.Workspace,
-			CPUs:      2,
-			MemoryMiB: 1024,
+			Name:       name,
+			Image:      image,
+			Workspace:  workspace,
+			Workspaces: runtimeWorkspaces(workspaces),
+			Ports:      runtimePorts(ports),
+			Allow:      runtimeRules(allow),
+			Deny:       runtimeRules(deny),
+			CPUs:       uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
+			MemoryMiB:  memoryMiB,
 		})
 		if err != nil {
 			return operation.Operation{}, err
 		}
 		state = sandbox.Running
 	}
-	sb := sandbox.Sandbox{
-		ID:         sbID,
-		Name:       name,
-		State:      state,
-		Generation: 1,
-		Image:      image,
-		Workspace:  req.Workspace,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
+	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, cpus, memoryMiB, now)
 	op := operation.Operation{
 		ID:             opID,
 		SandboxID:      sbID,
@@ -104,12 +630,376 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		UpdatedAt:      now,
 	}
 	if err := s.store.CreateSandboxWithOperation(ctx, sb, op); err != nil {
-		if s.backend != nil {
-			_ = s.backend.Delete(ctx, handle)
-		}
-		return operation.Operation{}, err
+		return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
 	}
 	return op, nil
+}
+
+func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uint32, error) {
+	image := req.Image
+	if image == "" {
+		image = s.DefaultImage
+	}
+	cpus, memoryMiB := req.CPUs, req.MemoryMiB
+	if cpus == 0 {
+		cpus = 2
+	}
+	if memoryMiB == 0 {
+		memoryMiB = 1024
+	}
+	if cpus > 64 || memoryMiB < 128 || memoryMiB > 65536 {
+		return "", 0, 0, fmt.Errorf("%w: invalid CPU or memory request", core.ErrConflict)
+	}
+	return image, cpus, memoryMiB, nil
+}
+
+func normalizeCreateWorkspaces(req CreateRequest) (string, []sandbox.Workspace, error) {
+	workspaces, err := normalizeWorkspaces(req)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(workspaces) == 0 {
+		return "", workspaces, nil
+	}
+	return workspaces[0].Path, workspaces, nil
+}
+
+func newSandboxRecord(id, name string, state sandbox.State, image, workspace string, workspaces []sandbox.Workspace, ports []sandbox.Port, allow, deny []sandbox.NetworkRule, agent string, detached bool, cpus, memoryMiB uint32, now time.Time) sandbox.Sandbox {
+	stoppedAt := time.Time{}
+	if state == sandbox.Stopped {
+		stoppedAt = now
+	}
+	return sandbox.Sandbox{
+		ID: id, Name: name, State: state, Generation: 1, Image: image,
+		Workspace: workspace, Workspaces: workspaces, Ports: ports, Policy: networkPolicy(allow, deny),
+		Meta: &sandbox.Meta{Agent: agent, Detached: detached, LastUsedAt: now},
+		CPUs: cpus, MemoryMiB: memoryMiB, StoppedAt: stoppedAt, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func normalizeWorkspaces(req CreateRequest) ([]sandbox.Workspace, error) {
+	workspaces := append([]sandbox.Workspace(nil), req.Workspaces...)
+	if len(workspaces) == 0 && req.Workspace != "" {
+		workspaces = []sandbox.Workspace{{Path: req.Workspace}}
+	}
+	if len(workspaces) > 16 {
+		return nil, fmt.Errorf("%w: too many workspaces", core.ErrConflict)
+	}
+	seen := make(map[string]struct{}, len(workspaces))
+	for i := range workspaces {
+		workspace := &workspaces[i]
+		if workspace.Path == "" || !filepath.IsAbs(workspace.Path) || strings.ContainsRune(workspace.Path, '\x00') {
+			return nil, fmt.Errorf("%w: workspace path must be absolute", core.ErrConflict)
+		}
+		workspace.Path = filepath.Clean(workspace.Path)
+		if _, exists := seen[workspace.Path]; exists {
+			return nil, fmt.Errorf("%w: duplicate workspace", core.ErrConflict)
+		}
+		seen[workspace.Path] = struct{}{}
+	}
+	return workspaces, nil
+}
+
+func runtimeWorkspaces(workspaces []sandbox.Workspace) []runtime.Workspace {
+	out := make([]runtime.Workspace, 0, len(workspaces))
+	for i := range workspaces {
+		out = append(out, runtime.Workspace{Path: workspaces[i].Path, ReadOnly: workspaces[i].ReadOnly})
+	}
+	return out
+}
+
+func normalizePorts(ports []sandbox.Port) ([]sandbox.Port, error) {
+	if len(ports) > 32 {
+		return nil, fmt.Errorf("%w: too many ports", core.ErrConflict)
+	}
+	seen := make(map[string]struct{}, len(ports))
+	out := make([]sandbox.Port, 0, len(ports))
+	for _, port := range ports {
+		if port.Host == 0 || port.Guest == 0 {
+			return nil, fmt.Errorf("%w: host and guest ports must be non-zero", core.ErrConflict)
+		}
+		if port.Protocol == "" {
+			port.Protocol = tcpProtocol
+		}
+		if port.Protocol != tcpProtocol && port.Protocol != udpProtocol {
+			return nil, fmt.Errorf("%w: port protocol must be tcp or udp", core.ErrConflict)
+		}
+		key := port.Protocol + ":" + strconv.Itoa(int(port.Host))
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("%w: duplicate host port", core.ErrConflict)
+		}
+		seen[key] = struct{}{}
+		out = append(out, port)
+	}
+	return out, nil
+}
+
+func runtimePorts(ports []sandbox.Port) []runtime.Port {
+	out := make([]runtime.Port, 0, len(ports))
+	for i := range ports {
+		out = append(out, runtime.Port{Host: ports[i].Host, Guest: ports[i].Guest, Protocol: ports[i].Protocol})
+	}
+	return out
+}
+
+func sandboxAgent(sb sandbox.Sandbox) string {
+	if sb.Meta == nil {
+		return ""
+	}
+	return sb.Meta.Agent
+}
+
+func sandboxDetached(sb sandbox.Sandbox) bool {
+	return sb.Meta != nil && sb.Meta.Detached
+}
+
+func normalizeCreateNetwork(req CreateRequest) ([]sandbox.Port, []sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	ports, err := normalizePorts(req.Ports)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := checkHostPorts(ports); err != nil {
+		return nil, nil, nil, err
+	}
+	allow, deny, err := normalizeCreateRules(req)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return ports, allow, deny, nil
+}
+
+func checkHostPorts(ports []sandbox.Port) error {
+	for _, port := range ports {
+		address := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port.Host)))
+		var closeProbe func() error
+		if port.Protocol == udpProtocol {
+			packet, err := net.ListenPacket("udp4", address)
+			if err != nil {
+				return fmt.Errorf("%w: host port %d/%s is already in use", core.ErrConflict, port.Host, port.Protocol)
+			}
+			closeProbe = packet.Close
+		} else {
+			listener, err := net.Listen("tcp4", address)
+			if err != nil {
+				return fmt.Errorf("%w: host port %d/%s is already in use", core.ErrConflict, port.Host, port.Protocol)
+			}
+			closeProbe = listener.Close
+		}
+		if err := closeProbe(); err != nil {
+			return fmt.Errorf("release host port %d probe: %w", port.Host, err)
+		}
+	}
+	return nil
+}
+
+func normalizeCreateRules(req CreateRequest) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	allow, err := normalizeRules(req.Allow)
+	if err != nil {
+		return nil, nil, err
+	}
+	deny, err := normalizeRules(req.Deny)
+	if err != nil {
+		return nil, nil, err
+	}
+	return allow, deny, nil
+}
+
+func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) {
+	if len(rules) > 64 {
+		return nil, fmt.Errorf("%w: too many network rules", core.ErrConflict)
+	}
+	out := make([]sandbox.NetworkRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Protocol == "" {
+			rule.Protocol = tcpProtocol
+		}
+		if rule.Protocol != tcpProtocol && rule.Protocol != "udp" {
+			return nil, fmt.Errorf("%w: network rule protocol must be tcp or udp", core.ErrConflict)
+		}
+		ip, _, err := net.ParseCIDR(rule.CIDR)
+		if err != nil || ip.To4() == nil {
+			return nil, fmt.Errorf("%w: network rule CIDR must be IPv4", core.ErrConflict)
+		}
+		out = append(out, rule)
+	}
+	return out, nil
+}
+
+func networkPolicy(allow, deny []sandbox.NetworkRule) *sandbox.NetworkPolicy {
+	if len(allow) == 0 && len(deny) == 0 {
+		return nil
+	}
+	return &sandbox.NetworkPolicy{Allow: allow, Deny: deny}
+}
+
+func policyAllow(policy *sandbox.NetworkPolicy) []sandbox.NetworkRule {
+	if policy == nil {
+		return nil
+	}
+	return policy.Allow
+}
+
+func policyDeny(policy *sandbox.NetworkPolicy) []sandbox.NetworkRule {
+	if policy == nil {
+		return nil
+	}
+	return policy.Deny
+}
+
+func runtimeRules(rules []sandbox.NetworkRule) []runtime.Rule {
+	out := make([]runtime.Rule, 0, len(rules))
+	for i := range rules {
+		out = append(out, runtime.Rule{Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port})
+	}
+	return out
+}
+
+func rulesEqual(a, b []sandbox.NetworkRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func portsEqual(a, b []sandbox.Port) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func workspacesEqual(a, b []sandbox.Workspace) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func validSandboxName(name string) bool {
+	if name == "" || len(name) > 63 || name == "." || name == ".." {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
+			(c < '0' || c > '9') && c != '-' && c != '_' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) cleanupCreateFailure(ctx context.Context, handle runtime.Handle, createErr error) error {
+	if s.backend == nil {
+		return createErr
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := s.backend.Delete(cleanupCtx, handle); err != nil {
+		return errors.Join(createErr, fmt.Errorf("cleanup failed after sandbox create: %w", err))
+	}
+	return createErr
+}
+
+func (s *Service) ensureNameAvailable(ctx context.Context, name string) error {
+	_, err := s.store.GetByName(ctx, name)
+	if err == nil {
+		return fmt.Errorf("%w: sandbox name already exists", core.ErrConflict)
+	}
+	if errors.Is(err, core.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
+// acquireCreateGates serializes matching names and keys without holding a
+// database transaction across runtime I/O. Fixed stripes bound memory use.
+func (s *Service) acquireCreateGates(ctx context.Context, name, key string) (func(), error) {
+	nameHash := sha256.Sum256([]byte("name:" + name))
+	first := int(nameHash[0]) % len(s.createGates)
+	second := first
+	if key != "" {
+		keyHash := sha256.Sum256([]byte("key:" + key))
+		second = int(keyHash[0]) % len(s.createGates)
+	}
+	if first > second {
+		first, second = second, first
+	}
+	acquired := make([]chan struct{}, 0, 2)
+	release := func() {
+		for i := len(acquired) - 1; i >= 0; i-- {
+			<-acquired[i]
+		}
+	}
+	for _, index := range []int{first, second} {
+		gate := s.createGates[index]
+		if len(acquired) > 0 && gate == acquired[0] {
+			continue
+		}
+		select {
+		case gate <- struct{}{}:
+			acquired = append(acquired, gate)
+		case <-ctx.Done():
+			release()
+			return nil, ctx.Err()
+		}
+	}
+	return release, nil
+}
+
+type createIntent struct {
+	name       string
+	image      string
+	workspace  string
+	workspaces []sandbox.Workspace
+	ports      []sandbox.Port
+	allow      []sandbox.NetworkRule
+	deny       []sandbox.NetworkRule
+	agent      string
+	detached   bool
+	cpus       uint32
+	memoryMiB  uint32
+}
+
+func (s *Service) replayCreate(ctx context.Context, key string, intent createIntent) (operation.Operation, error) {
+	op, err := s.store.Operations().GetByIdempotencyKey(ctx, key)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	sb, err := s.store.Get(ctx, op.SandboxID)
+	if errors.Is(err, core.ErrNotFound) {
+		return operation.Operation{}, fmt.Errorf("%w: idempotency key refers to a removed sandbox", core.ErrConflict)
+	}
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	if op.Kind != operation.KindCreate || !matchesCreateIntent(sb, intent) {
+		return operation.Operation{}, fmt.Errorf("%w: idempotency key was used for a different request", core.ErrConflict)
+	}
+	return op, nil
+}
+
+func matchesCreateIntent(sb sandbox.Sandbox, intent createIntent) bool {
+	return sb.Name == intent.name && sb.Image == intent.image && sb.Workspace == intent.workspace &&
+		sb.CPUs == intent.cpus && sb.MemoryMiB == intent.memoryMiB &&
+		workspacesEqual(sb.Workspaces, intent.workspaces) && portsEqual(sb.Ports, intent.ports) &&
+		rulesEqual(policyAllow(sb.Policy), intent.allow) && rulesEqual(policyDeny(sb.Policy), intent.deny) &&
+		sandboxAgent(sb) == intent.agent && sandboxDetached(sb) == intent.detached
 }
 
 // Reconcile repairs state left behind by an interrupted daemon.
@@ -164,6 +1054,11 @@ func (s *Service) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox
 
 // Start transitions a sandbox to running.
 func (s *Service) Start(ctx context.Context, id string) (operation.Operation, error) {
+	release, err := s.acquireLifecycle(ctx, id)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	defer release()
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
 		return operation.Operation{}, err
@@ -175,15 +1070,198 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
 	if s.backend != nil {
-		if err := s.backend.Start(ctx, s.backend.Handle(sb.Name)); err != nil {
-			return operation.Operation{}, err
+		handle := s.backend.Handle(sb.Name)
+		handle.Ports = runtimePorts(sb.Ports)
+		handle.Allow = runtimeRules(policyAllow(sb.Policy))
+		handle.Deny = runtimeRules(policyDeny(sb.Policy))
+		if err := s.backend.Start(ctx, handle); err != nil {
+			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
-	return s.apply(ctx, sb, operation.KindStart, sandbox.Running)
+	op, err := s.apply(ctx, sb, operation.KindStart, sandbox.Running)
+	if err != nil && s.backend != nil {
+		return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+	}
+	return op, err
+}
+
+// UpdatePorts replaces the stored and live published ports.
+func (s *Service) UpdatePorts(ctx context.Context, id string, ports []sandbox.Port) (sandbox.Sandbox, error) {
+	release, err := s.acquireLifecycle(ctx, id)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	defer release()
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
+		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
+	}
+	normalized, err := normalizePorts(ports)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	existing := make(map[uint16]struct{}, len(sb.Ports))
+	for _, port := range sb.Ports {
+		existing[port.Host] = struct{}{}
+	}
+	for _, port := range normalized {
+		if _, ok := existing[port.Host]; ok {
+			continue
+		}
+		if err := checkHostPorts([]sandbox.Port{port}); err != nil {
+			return sandbox.Sandbox{}, err
+		}
+	}
+	if sb.State == sandbox.Running {
+		updater, ok := s.backend.(runtime.PortUpdater)
+		if !ok {
+			return sandbox.Sandbox{}, fmt.Errorf("%w: runtime does not support live port updates", core.ErrConflict)
+		}
+		handle := s.backend.Handle(sb.Name)
+		handle.Ports = runtimePorts(normalized)
+		if err := updater.UpdatePorts(ctx, handle, runtimePorts(normalized)); err != nil {
+			return sandbox.Sandbox{}, s.markRuntimeUnknown(ctx, sb, err)
+		}
+	} else if sb.State != sandbox.Stopped {
+		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is not ready for a port update", core.ErrConflict)
+	}
+	sb.Ports = normalized
+	sb.UpdatedAt = s.now().UTC()
+	if err := s.store.Update(ctx, sb); err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	return sb, nil
+}
+
+// MutatePolicy applies one rule while holding the sandbox lifecycle gate.
+func (s *Service) MutatePolicy(ctx context.Context, id, action string, rule sandbox.NetworkRule) (sandbox.Sandbox, error) {
+	release, err := s.acquireLifecycle(ctx, id)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	defer release()
+	normalized, err := normalizeRules([]sandbox.NetworkRule{rule})
+	if err != nil || len(normalized) != 1 {
+		return sandbox.Sandbox{}, fmt.Errorf("%w: invalid policy rule", core.ErrConflict)
+	}
+	rule = normalized[0]
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	allow := append([]sandbox.NetworkRule(nil), policyAllow(sb.Policy)...)
+	deny := append([]sandbox.NetworkRule(nil), policyDeny(sb.Policy)...)
+	switch action {
+	case "allow":
+		if slices.Contains(allow, rule) {
+			return sandbox.Sandbox{}, fmt.Errorf("%w: allow rule already exists", core.ErrConflict)
+		}
+		allow = append(allow, rule)
+	case "deny":
+		if slices.Contains(deny, rule) {
+			return sandbox.Sandbox{}, fmt.Errorf("%w: deny rule already exists", core.ErrConflict)
+		}
+		deny = append(deny, rule)
+	case "rm":
+		if !slices.Contains(allow, rule) && !slices.Contains(deny, rule) {
+			return sandbox.Sandbox{}, fmt.Errorf("%w: policy rule not found", core.ErrConflict)
+		}
+		allow = slices.DeleteFunc(allow, func(r sandbox.NetworkRule) bool { return r == rule })
+		deny = slices.DeleteFunc(deny, func(r sandbox.NetworkRule) bool { return r == rule })
+	default:
+		return sandbox.Sandbox{}, fmt.Errorf("%w: invalid policy action", core.ErrConflict)
+	}
+	return s.updatePolicyLocked(ctx, id, allow, deny)
+}
+
+// UpdatePolicy replaces the stored and live egress policy for internal callers.
+func (s *Service) UpdatePolicy(ctx context.Context, id string, allow, deny []sandbox.NetworkRule) (sandbox.Sandbox, error) {
+	release, err := s.acquireLifecycle(ctx, id)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	defer release()
+	return s.updatePolicyLocked(ctx, id, allow, deny)
+}
+
+func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny []sandbox.NetworkRule) (sandbox.Sandbox, error) {
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
+		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
+	}
+	normalizedAllow, err := normalizeRules(allow)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	normalizedDeny, err := normalizeRules(deny)
+	if err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	revision := int(s.now().UnixNano())
+	if revision <= 1 {
+		revision = 2
+	}
+	if sb.State != sandbox.Running && sb.State != sandbox.Stopped {
+		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is not ready for a policy update", core.ErrConflict)
+	}
+	if sb.State == sandbox.Running {
+		updater, ok := s.backend.(runtime.PolicyUpdater)
+		if !ok {
+			return sandbox.Sandbox{}, fmt.Errorf("%w: runtime does not support live policy updates", core.ErrConflict)
+		}
+		// Persist the intended policy and an uncertain runtime state before any
+		// live change. A crash or a failed reload must never restore old rules.
+		sb.Policy = networkPolicy(normalizedAllow, normalizedDeny)
+		sb.State = sandbox.Unknown
+		sb.Error = "policy update in progress; runtime state is unknown"
+		sb.UpdatedAt = s.now().UTC()
+		if err := s.store.Update(ctx, sb); err != nil {
+			return sandbox.Sandbox{}, err
+		}
+		handle := s.backend.Handle(sb.Name)
+		handle.Ports = runtimePorts(sb.Ports)
+		if err := updater.UpdatePolicy(ctx, handle, runtimeRules(normalizedAllow), runtimeRules(normalizedDeny), revision); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			stopErr := s.backend.Stop(cleanupCtx, handle, 5*time.Second)
+			cancel()
+			return sandbox.Sandbox{}, s.markRuntimeUnknown(ctx, sb, errors.Join(err, stopErr))
+		}
+		sb.State = sandbox.Running
+		sb.Error = ""
+	}
+	sb.Policy = networkPolicy(normalizedAllow, normalizedDeny)
+	sb.UpdatedAt = s.now().UTC()
+	if err := s.store.Update(ctx, sb); err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	return sb, nil
 }
 
 // Stop transitions a sandbox to stopped.
 func (s *Service) Stop(ctx context.Context, id string) (operation.Operation, error) {
+	return s.StopWithGrace(ctx, id, 0)
+}
+
+// StopWithGrace transitions a sandbox to stopped using the requested grace period.
+// Zero selects the default of five seconds.
+func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Duration) (operation.Operation, error) {
+	if grace < 0 || grace > time.Hour {
+		return operation.Operation{}, fmt.Errorf("%w: invalid stop grace period", core.ErrConflict)
+	}
+	if grace == 0 {
+		grace = 5 * time.Second
+	}
+	release, err := s.acquireLifecycle(ctx, id)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	defer release()
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
 		return operation.Operation{}, err
@@ -191,26 +1269,41 @@ func (s *Service) Stop(ctx context.Context, id string) (operation.Operation, err
 	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
+	if err := s.cancelExecSessions(ctx, id); err != nil {
+		return operation.Operation{}, err
+	}
 	if s.backend != nil {
-		if err := s.backend.Stop(ctx, s.backend.Handle(sb.Name), 5*time.Second); err != nil {
-			return operation.Operation{}, err
+		if err := s.backend.Stop(ctx, s.backend.Handle(sb.Name), grace); err != nil {
+			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
-	return s.apply(ctx, sb, operation.KindStop, sandbox.Stopped)
+	op, err := s.apply(ctx, sb, operation.KindStop, sandbox.Stopped)
+	if err != nil && s.backend != nil {
+		return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+	}
+	return op, err
 }
 
 // Delete removes a sandbox.
 func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.Operation, error) {
+	release, err := s.acquireLifecycle(ctx, id)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	defer release()
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	if sb.State == sandbox.Running && !force {
-		return operation.Operation{}, fmt.Errorf("%w: running sandbox requires force", core.ErrConflict)
+	if !force && (sb.State == sandbox.Running || sb.State == sandbox.Unknown || sb.State == sandbox.Creating || sb.State == sandbox.Stopping) {
+		return operation.Operation{}, fmt.Errorf("%w: sandbox may be running; force is required", core.ErrConflict)
+	}
+	if err := s.cancelExecSessions(ctx, id); err != nil {
+		return operation.Operation{}, err
 	}
 	if s.backend != nil {
-		if err := s.backend.Delete(ctx, s.backend.Handle(sb.Name)); err != nil && !force {
-			return operation.Operation{}, err
+		if err := s.backend.Delete(ctx, s.backend.Handle(sb.Name)); err != nil {
+			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
 	now := s.now().UTC()
@@ -228,9 +1321,39 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 		UpdatedAt:  now,
 	}
 	if err := s.store.DeleteSandboxWithOperation(ctx, id, op); err != nil {
+		if s.backend != nil {
+			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+		}
 		return operation.Operation{}, err
 	}
+	if err := s.cleanupSandboxRegistryCredentials(ctx, sb.Name); err != nil {
+		return op, err
+	}
 	return op, nil
+}
+
+func (s *Service) markRuntimeUnknown(ctx context.Context, sb sandbox.Sandbox, cause error) error {
+	sb.State = sandbox.Unknown
+	sb.Error = "runtime operation failed; actual state is unknown"
+	sb.Generation++
+	sb.UpdatedAt = s.now().UTC()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.store.Update(cleanupCtx, sb); err != nil {
+		return errors.Join(cause, fmt.Errorf("record unknown runtime state: %w", err))
+	}
+	return cause
+}
+
+func (s *Service) acquireLifecycle(ctx context.Context, id string) (func(), error) {
+	sum := sha256.Sum256([]byte(id))
+	gate := s.lifecycleGates[int(sum[0])%len(s.lifecycleGates)]
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // GetOperation returns an operation by ID.
@@ -265,6 +1388,18 @@ func (s *Service) apply(ctx context.Context, sb sandbox.Sandbox, kind operation.
 		return operation.Operation{}, err
 	}
 	sb.State = state
+	switch state {
+	case sandbox.Stopped:
+		sb.StoppedAt = now
+	case sandbox.Running:
+		sb.StoppedAt = time.Time{}
+	}
+	if sb.Meta == nil {
+		sb.Meta = &sandbox.Meta{}
+	}
+	if state == sandbox.Running {
+		sb.Meta.LastUsedAt = now
+	}
 	sb.Generation++
 	sb.UpdatedAt = now
 	op := operation.Operation{

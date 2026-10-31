@@ -11,11 +11,13 @@ permissions:
 jobs:
   go:
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.27.3'
           cache: true
       - name: Format
         run: test -z "$(gofmt -l .)"

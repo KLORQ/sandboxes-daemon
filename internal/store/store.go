@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -66,6 +67,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			generation INTEGER NOT NULL,
 			image TEXT NOT NULL,
 			workspace TEXT NOT NULL,
+			workspaces TEXT NOT NULL DEFAULT '[]',
+			ports TEXT NOT NULL DEFAULT '[]',
+			allow_rules TEXT NOT NULL DEFAULT '[]',
+			deny_rules TEXT NOT NULL DEFAULT '[]',
+			agent TEXT NOT NULL DEFAULT '',
+			detached INTEGER NOT NULL DEFAULT 0,
+			last_used_at INTEGER NOT NULL DEFAULT 0,
+			cpus INTEGER NOT NULL DEFAULT 2,
+			memory_mib INTEGER NOT NULL DEFAULT 1024,
+			stopped_at INTEGER NOT NULL DEFAULT 0,
 			error TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
@@ -84,10 +95,68 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS operations_idempotency
 			ON operations(idempotency_key) WHERE idempotency_key <> ''`,
 		`CREATE INDEX IF NOT EXISTS operations_sandbox ON operations(sandbox_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS registry_credential_index (
+			registry TEXT NOT NULL,
+			scope TEXT NOT NULL,
+			sandbox_name TEXT NOT NULL DEFAULT '',
+			username TEXT NOT NULL,
+			PRIMARY KEY (registry, scope, sandbox_name)
+		)`,
 	}
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migrate: %w", err)
+		}
+	}
+	if err := s.ensureSandboxResourceColumns(ctx); err != nil {
+		return fmt.Errorf("migrate sandbox resources: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureSandboxResourceColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(sandboxes)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"cpus", "cpus INTEGER NOT NULL DEFAULT 2"},
+		{"memory_mib", "memory_mib INTEGER NOT NULL DEFAULT 1024"},
+		{"stopped_at", "stopped_at INTEGER NOT NULL DEFAULT 0"},
+		{"workspaces", "workspaces TEXT NOT NULL DEFAULT '[]'"},
+		{"ports", "ports TEXT NOT NULL DEFAULT '[]'"},
+		{"allow_rules", "allow_rules TEXT NOT NULL DEFAULT '[]'"},
+		{"deny_rules", "deny_rules TEXT NOT NULL DEFAULT '[]'"},
+		{"agent", "agent TEXT NOT NULL DEFAULT ''"},
+		{"detached", "detached INTEGER NOT NULL DEFAULT 0"},
+		{"last_used_at", "last_used_at INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if _, ok := columns[column.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE sandboxes ADD COLUMN "+column.definition); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -95,10 +164,23 @@ func (s *Store) migrate(ctx context.Context) error {
 
 // Create inserts a sandbox.
 func (s *Store) Create(ctx context.Context, sb sandbox.Sandbox) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO sandboxes
-		(id, name, state, generation, image, workspace, error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)`,
-		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, sb.Error,
+	workspaces, err := encodeWorkspaces(sb.Workspaces)
+	if err != nil {
+		return err
+	}
+	ports, err := encodePorts(sb.Ports)
+	if err != nil {
+		return err
+	}
+	allow, deny, err := encodePolicy(sb.Policy)
+	if err != nil {
+		return err
+	}
+	agent, detached, lastUsed := metaValues(sb)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO sandboxes
+		(id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error,
 		toUnix(sb.CreatedAt), toUnix(sb.UpdatedAt))
 	return mapSQLError(err)
 }
@@ -115,16 +197,29 @@ func (s *Store) GetByName(ctx context.Context, name string) (sandbox.Sandbox, er
 
 func (s *Store) getSandbox(ctx context.Context, where string, arg any) (sandbox.Sandbox, error) {
 	var sb sandbox.Sandbox
-	var created, updated int64
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, state, generation, image, workspace, error, created_at, updated_at
+	var created, updated, stoppedAt int64
+	var workspaces, ports, allow, deny, agent string
+	var detached, lastUsed int64
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at
 		FROM sandboxes WHERE `+where, arg).Scan(
-		&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &sb.Error, &created, &updated)
+		&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &workspaces, &ports, &allow, &deny, &agent, &detached, &lastUsed, &sb.CPUs, &sb.MemoryMiB, &stoppedAt, &sb.Error, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sandbox.Sandbox{}, core.ErrNotFound
 	}
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
+	if err := decodeWorkspaces(workspaces, &sb); err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	if err := decodePorts(ports, &sb); err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	if err := decodePolicy(allow, deny, &sb); err != nil {
+		return sandbox.Sandbox{}, err
+	}
+	decodeMeta(agent, detached, lastUsed, &sb)
+	sb.StoppedAt = fromUnix(stoppedAt)
 	sb.CreatedAt = fromUnix(created)
 	sb.UpdatedAt = fromUnix(updated)
 	return sb, nil
@@ -143,7 +238,7 @@ func (s *Store) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox.S
 	if err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, state, generation, image, workspace, error, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at
 		FROM sandboxes ORDER BY created_at, id LIMIT ? OFFSET ?`, pageSize+1, offset)
 	if err != nil {
 		return nil, "", err
@@ -153,10 +248,23 @@ func (s *Store) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox.S
 	var out []sandbox.Sandbox
 	for rows.Next() {
 		var sb sandbox.Sandbox
-		var created, updated int64
-		if err := rows.Scan(&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &sb.Error, &created, &updated); err != nil {
+		var created, updated, stoppedAt int64
+		var workspaces, ports, allow, deny, agent string
+		var detached, lastUsed int64
+		if err := rows.Scan(&sb.ID, &sb.Name, &sb.State, &sb.Generation, &sb.Image, &sb.Workspace, &workspaces, &ports, &allow, &deny, &agent, &detached, &lastUsed, &sb.CPUs, &sb.MemoryMiB, &stoppedAt, &sb.Error, &created, &updated); err != nil {
 			return nil, "", err
 		}
+		if err := decodeWorkspaces(workspaces, &sb); err != nil {
+			return nil, "", err
+		}
+		if err := decodePorts(ports, &sb); err != nil {
+			return nil, "", err
+		}
+		if err := decodePolicy(allow, deny, &sb); err != nil {
+			return nil, "", err
+		}
+		decodeMeta(agent, detached, lastUsed, &sb)
+		sb.StoppedAt = fromUnix(stoppedAt)
 		sb.CreatedAt = fromUnix(created)
 		sb.UpdatedAt = fromUnix(updated)
 		out = append(out, sb)
@@ -174,9 +282,22 @@ func (s *Store) List(ctx context.Context, opts sandbox.ListOptions) ([]sandbox.S
 
 // Update updates a sandbox.
 func (s *Store) Update(ctx context.Context, sb sandbox.Sandbox) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET name=?, state=?, generation=?, image=?, workspace=?, error=?, updated_at=?
+	workspaces, err := encodeWorkspaces(sb.Workspaces)
+	if err != nil {
+		return err
+	}
+	ports, err := encodePorts(sb.Ports)
+	if err != nil {
+		return err
+	}
+	allow, deny, err := encodePolicy(sb.Policy)
+	if err != nil {
+		return err
+	}
+	agent, detached, lastUsed := metaValues(sb)
+	res, err := s.db.ExecContext(ctx, `UPDATE sandboxes SET name=?, state=?, generation=?, image=?, workspace=?, workspaces=?, ports=?, allow_rules=?, deny_rules=?, agent=?, detached=?, last_used_at=?, cpus=?, memory_mib=?, stopped_at=?, error=?, updated_at=?
 		WHERE id=?`,
-		sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, sb.Error, toUnix(sb.UpdatedAt), sb.ID)
+		sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error, toUnix(sb.UpdatedAt), sb.ID)
 	if err != nil {
 		return mapSQLError(err)
 	}
@@ -218,10 +339,22 @@ func (s *OperationStore) Create(opCtx context.Context, op operation.Operation) e
 
 // Get returns an operation by ID.
 func (s *OperationStore) Get(ctx context.Context, id string) (operation.Operation, error) {
+	return s.getBy(ctx, "id", id)
+}
+
+// GetByIdempotencyKey returns the operation associated with a non-empty key.
+func (s *OperationStore) GetByIdempotencyKey(ctx context.Context, key string) (operation.Operation, error) {
+	if key == "" {
+		return operation.Operation{}, core.ErrNotFound
+	}
+	return s.getBy(ctx, "idempotency_key", key)
+}
+
+func (s *OperationStore) getBy(ctx context.Context, column, value string) (operation.Operation, error) {
 	var op operation.Operation
 	var created, updated int64
 	err := s.db.QueryRowContext(ctx, `SELECT id, sandbox_id, kind, state, generation, idempotency_key, error, created_at, updated_at
-		FROM operations WHERE id=?`, id).Scan(
+		FROM operations WHERE `+column+`=?`, value).Scan(
 		&op.ID, &op.SandboxID, &op.Kind, &op.State, &op.Generation, &op.IdempotencyKey, &op.Error, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return operation.Operation{}, core.ErrNotFound
@@ -302,10 +435,23 @@ func (s *Store) CreateSandboxWithOperation(ctx context.Context, sb sandbox.Sandb
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	workspaces, err := encodeWorkspaces(sb.Workspaces)
+	if err != nil {
+		return err
+	}
+	ports, err := encodePorts(sb.Ports)
+	if err != nil {
+		return err
+	}
+	allow, deny, err := encodePolicy(sb.Policy)
+	if err != nil {
+		return err
+	}
+	agent, detached, lastUsed := metaValues(sb)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sandboxes
-		(id, name, state, generation, image, workspace, error, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)`,
-		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, sb.Error,
+		(id, name, state, generation, image, workspace, workspaces, ports, allow_rules, deny_rules, agent, detached, last_used_at, cpus, memory_mib, stopped_at, error, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		sb.ID, sb.Name, sb.State, sb.Generation, sb.Image, sb.Workspace, workspaces, ports, allow, deny, agent, detached, lastUsed, sb.CPUs, sb.MemoryMiB, toUnix(sb.StoppedAt), sb.Error,
 		toUnix(sb.CreatedAt), toUnix(sb.UpdatedAt)); err != nil {
 		return mapSQLError(err)
 	}
@@ -326,8 +472,9 @@ func (s *Store) ApplySandboxOperation(ctx context.Context, sb sandbox.Sandbox, o
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.ExecContext(ctx, `UPDATE sandboxes SET state=?, generation=?, error=?, updated_at=? WHERE id=?`,
-		sb.State, sb.Generation, sb.Error, toUnix(sb.UpdatedAt), sb.ID)
+	agent, detached, lastUsed := metaValues(sb)
+	res, err := tx.ExecContext(ctx, `UPDATE sandboxes SET state=?, generation=?, agent=?, detached=?, last_used_at=?, stopped_at=?, error=?, updated_at=? WHERE id=?`,
+		sb.State, sb.Generation, agent, detached, lastUsed, toUnix(sb.StoppedAt), sb.Error, toUnix(sb.UpdatedAt), sb.ID)
 	if err != nil {
 		return err
 	}
@@ -400,6 +547,20 @@ func fromUnix(n int64) time.Time {
 	return time.Unix(n, 0).UTC()
 }
 
+func toUnixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func fromUnixNano(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n).UTC()
+}
+
 func encodeOffset(n int) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(n)))
 }
@@ -417,4 +578,151 @@ func decodeOffset(token string) (int, error) {
 		return 0, fmt.Errorf("invalid page token")
 	}
 	return n, nil
+}
+
+func encodeWorkspaces(workspaces []sandbox.Workspace) (string, error) {
+	if len(workspaces) == 0 {
+		return "[]", nil
+	}
+	data, err := json.Marshal(workspaces)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func decodeWorkspaces(value string, sb *sandbox.Sandbox) error {
+	if value == "" || value == "[]" {
+		if sb.Workspace != "" {
+			sb.Workspaces = []sandbox.Workspace{{Path: sb.Workspace}}
+		}
+		return nil
+	}
+	if err := json.Unmarshal([]byte(value), &sb.Workspaces); err != nil {
+		return fmt.Errorf("decode workspaces: %w", err)
+	}
+	if len(sb.Workspaces) == 0 && sb.Workspace != "" {
+		sb.Workspaces = []sandbox.Workspace{{Path: sb.Workspace}}
+	}
+	return nil
+}
+
+func encodePorts(ports []sandbox.Port) (string, error) {
+	if len(ports) == 0 {
+		return "[]", nil
+	}
+	data, err := json.Marshal(ports)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func decodePorts(value string, sb *sandbox.Sandbox) error {
+	if value == "" || value == "[]" {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(value), &sb.Ports); err != nil {
+		return fmt.Errorf("decode ports: %w", err)
+	}
+	return nil
+}
+
+func encodePolicy(policy *sandbox.NetworkPolicy) (string, string, error) {
+	if policy == nil || (len(policy.Allow) == 0 && len(policy.Deny) == 0) {
+		return "[]", "[]", nil
+	}
+	allow, err := json.Marshal(policy.Allow)
+	if err != nil {
+		return "", "", err
+	}
+	deny, err := json.Marshal(policy.Deny)
+	if err != nil {
+		return "", "", err
+	}
+	return string(allow), string(deny), nil
+}
+
+func decodePolicy(allow, deny string, sb *sandbox.Sandbox) error {
+	var policy sandbox.NetworkPolicy
+	if allow != "" && allow != "[]" {
+		if err := json.Unmarshal([]byte(allow), &policy.Allow); err != nil {
+			return fmt.Errorf("decode allow rules: %w", err)
+		}
+	}
+	if deny != "" && deny != "[]" {
+		if err := json.Unmarshal([]byte(deny), &policy.Deny); err != nil {
+			return fmt.Errorf("decode deny rules: %w", err)
+		}
+	}
+	if len(policy.Allow) > 0 || len(policy.Deny) > 0 {
+		sb.Policy = &policy
+	}
+	return nil
+}
+
+func metaValues(sb sandbox.Sandbox) (string, int64, int64) {
+	if sb.Meta == nil {
+		return "", 0, 0
+	}
+	detached := int64(0)
+	if sb.Meta.Detached {
+		detached = 1
+	}
+	return sb.Meta.Agent, detached, toUnixNano(sb.Meta.LastUsedAt)
+}
+
+func decodeMeta(agent string, detached, lastUsed int64, sb *sandbox.Sandbox) {
+	if agent == "" && detached == 0 && lastUsed == 0 {
+		return
+	}
+	sb.Meta = &sandbox.Meta{Agent: agent, Detached: detached != 0, LastUsedAt: fromUnixNano(lastUsed)}
+}
+
+// RegistryCredentialIndex is non-secret metadata for a stored registry login.
+type RegistryCredentialIndex struct {
+	Registry    string
+	Username    string
+	Scope       string
+	SandboxName string
+}
+
+// UpsertRegistryCredentialIndex records a non-secret registry credential summary.
+func (s *Store) UpsertRegistryCredentialIndex(ctx context.Context, entry RegistryCredentialIndex) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO registry_credential_index (registry, scope, sandbox_name, username)
+		VALUES (?,?,?,?)
+		ON CONFLICT(registry, scope, sandbox_name) DO UPDATE SET username=excluded.username`,
+		entry.Registry, entry.Scope, entry.SandboxName, entry.Username)
+	if err != nil {
+		return fmt.Errorf("record registry credential index: %w", err)
+	}
+	return nil
+}
+
+// DeleteRegistryCredentialIndex removes one non-secret registry credential summary.
+func (s *Store) DeleteRegistryCredentialIndex(ctx context.Context, registry, scope, sandboxName string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM registry_credential_index WHERE registry=? AND scope=? AND sandbox_name=?`,
+		registry, scope, sandboxName)
+	if err != nil {
+		return fmt.Errorf("delete registry credential index: %w", err)
+	}
+	return nil
+}
+
+// ListRegistryCredentialIndex lists non-secret registry credential summaries.
+func (s *Store) ListRegistryCredentialIndex(ctx context.Context) ([]RegistryCredentialIndex, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT registry, username, scope, sandbox_name FROM registry_credential_index ORDER BY registry, scope, sandbox_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list registry credential index: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []RegistryCredentialIndex
+	for rows.Next() {
+		var entry RegistryCredentialIndex
+		if err := rows.Scan(&entry.Registry, &entry.Username, &entry.Scope, &entry.SandboxName); err != nil {
+			return nil, fmt.Errorf("scan registry credential index: %w", err)
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
 }
