@@ -565,6 +565,8 @@ type CreateRequest struct {
 }
 
 // Create creates a stopped sandbox and a completed create operation.
+//
+//nolint:gocyclo,cyclop // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Operation, error) {
 	name := strings.TrimSpace(req.Name)
 	if !validSandboxName(name) {
@@ -634,6 +636,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		state = sandbox.Running
 	}
 	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, profile, cpus, memoryMiB, now)
+	if err := s.setDockerProfile(ctx, sbID, req.Privileged); err != nil {
+		return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
+	}
 	op := operation.Operation{
 		ID:             opID,
 		SandboxID:      sbID,
@@ -1237,6 +1242,44 @@ func mergePolicyRules(profile, explicit []sandbox.NetworkRule) []sandbox.Network
 	return out
 }
 
+func (s *Service) setDockerProfile(ctx context.Context, id string, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	return s.store.SetSetting(ctx, dockerSettingKey(id), "true")
+}
+
+func (s *Service) startRuntimeSandbox(ctx context.Context, sb sandbox.Sandbox) error {
+	handle := s.backend.Handle(sb.Name)
+	handle.Ports = runtimePorts(sb.Ports)
+	handle.Allow = runtimeRules(policyAllow(sb.Policy))
+	handle.Deny = runtimeRules(policyDeny(sb.Policy))
+	if err := s.backend.Start(ctx, handle); err != nil {
+		return err
+	}
+	enabled, err := s.dockerProfileEnabled(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return nil
+	}
+	return s.startDockerProfile(ctx, handle)
+}
+
+func dockerSettingKey(id string) string { return "sandbox.docker." + id }
+
+func (s *Service) dockerProfileEnabled(ctx context.Context, id string) (bool, error) {
+	value, err := s.store.GetSetting(ctx, dockerSettingKey(id))
+	if errors.Is(err, core.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return value == "true", nil
+}
+
 func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, handle runtime.Handle) error {
 	if !enabled {
 		return nil
@@ -1373,11 +1416,7 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
 	if s.backend != nil {
-		handle := s.backend.Handle(sb.Name)
-		handle.Ports = runtimePorts(sb.Ports)
-		handle.Allow = runtimeRules(policyAllow(sb.Policy))
-		handle.Deny = runtimeRules(policyDeny(sb.Policy))
-		if err := s.backend.Start(ctx, handle); err != nil {
+		if err := s.startRuntimeSandbox(ctx, sb); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
