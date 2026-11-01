@@ -1210,6 +1210,9 @@ func TestNormalizeDomainRules(t *testing.T) {
 	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "*"}}); err == nil {
 		t.Fatal("bare wildcard accepted")
 	}
+	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "192.0.2.10", Port: 443}}); err == nil {
+		t.Fatal("IP literal accepted as a domain rule")
+	}
 }
 
 func TestCheckPolicyAppliesGlobalProfileRules(t *testing.T) {

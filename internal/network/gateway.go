@@ -4,6 +4,7 @@ package network
 import (
 	"context"
 	"path/filepath"
+	"time"
 
 	gateway "github.com/KLORQ/sandboxes-gateway"
 	"github.com/KLORQ/sandboxes-gateway/policy"
@@ -36,7 +37,9 @@ func (a *Adapter) Start(ctx context.Context, sandbox string, ports []runtime.Por
 		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol, HostIP: port.HostIP})
 	}
 	net, err := a.manager.Start(ctx, policy.Policy{
-		Revision:  1,
+		// The start policy uses the same monotonic generation as later
+		// reloads so an audit revision never jumps backwards.
+		Revision:  int(time.Now().UnixNano()),
 		SandboxID: sandbox,
 		AuditPath: filepath.Join(a.auditDir, sandbox+".audit.jsonl"),
 		Ports:     policyPorts,
@@ -88,7 +91,7 @@ var _ runtime.Network = (*Adapter)(nil)
 func toPolicyRules(rules []runtime.Rule, action policy.Action) []policy.Rule {
 	out := make([]policy.Rule, 0, len(rules))
 	for i := range rules {
-		out = append(out, policy.Rule{Action: action, Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port, Domain: rules[i].Domain})
+		out = append(out, policy.Rule{ID: rules[i].ID, Action: action, Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port, Domain: rules[i].Domain})
 	}
 	return out
 }
