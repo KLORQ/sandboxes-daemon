@@ -232,6 +232,8 @@ func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) 
 		Deny:           deny,
 		Agent:          req.GetAgent(),
 		Detached:       req.GetDetached(),
+		PolicyProfile:  req.GetPolicyProfile(),
+		Privileged:     req.GetPrivileged(),
 		Env:            req.GetEnv(),
 	})
 	if err != nil {
@@ -397,6 +399,24 @@ func (s *OperationServer) Wait(ctx context.Context, req *localv1.OperationServic
 	return &localv1.OperationServiceWaitResponse{Operation: toProtoOperation(op)}, nil
 }
 
+// GetPolicyProfile returns the global default profile for new sandboxes.
+func (s *SandboxServer) GetPolicyProfile(ctx context.Context, _ *localv1.GetPolicyProfileRequest) (*localv1.GetPolicyProfileResponse, error) {
+	profile, err := s.svc.GetPolicyProfile(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &localv1.GetPolicyProfileResponse{Profile: profile}, nil
+}
+
+// SetPolicyProfile sets the global default profile for new sandboxes.
+func (s *SandboxServer) SetPolicyProfile(ctx context.Context, req *localv1.SetPolicyProfileRequest) (*localv1.SetPolicyProfileResponse, error) {
+	profile, err := s.svc.SetPolicyProfile(ctx, req.GetProfile())
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &localv1.SetPolicyProfileResponse{Profile: profile}, nil
+}
+
 func mapError(err error) error {
 	switch {
 	case err == nil:
@@ -434,6 +454,7 @@ func toProtoSandbox(sb sandbox.Sandbox) *localv1.Sandbox {
 		Deny:               toProtoRules(policyRules(sb.Policy, false)),
 		Agent:              metaAgent(sb),
 		Detached:           metaDetached(sb),
+		PolicyProfile:      metaPolicyProfile(sb),
 		LastUsedAtUnix:     metaLastUsed(sb),
 		LastUsedAtUnixNano: metaLastUsedNano(sb),
 	}
@@ -534,7 +555,7 @@ func fromProtoWorkspaces(workspaces []*localv1.Workspace) []sandbox.Workspace {
 func toProtoPorts(ports []sandbox.Port) []*localv1.Port {
 	out := make([]*localv1.Port, 0, len(ports))
 	for i := range ports {
-		out = append(out, &localv1.Port{Host: uint32(ports[i].Host), Guest: uint32(ports[i].Guest), Protocol: ports[i].Protocol})
+		out = append(out, &localv1.Port{Host: uint32(ports[i].Host), Guest: uint32(ports[i].Guest), Protocol: ports[i].Protocol, HostIp: ports[i].HostIP})
 	}
 	return out
 }
@@ -545,7 +566,7 @@ func fromProtoPorts(ports []*localv1.Port) []sandbox.Port {
 		if port == nil || port.GetHost() > 65535 || port.GetGuest() > 65535 {
 			continue
 		}
-		out = append(out, sandbox.Port{Host: uint16(port.GetHost()), Guest: uint16(port.GetGuest()), Protocol: port.GetProtocol()}) //nolint:gosec // bounds checked above.
+		out = append(out, sandbox.Port{Host: uint16(port.GetHost()), Guest: uint16(port.GetGuest()), Protocol: port.GetProtocol(), HostIP: port.GetHostIp()}) //nolint:gosec // bounds checked above.
 	}
 	return out
 }
@@ -577,6 +598,13 @@ func policyRules(policy *sandbox.NetworkPolicy, allow bool) []sandbox.NetworkRul
 		return policy.Allow
 	}
 	return policy.Deny
+}
+
+func metaPolicyProfile(sb sandbox.Sandbox) string {
+	if sb.Meta == nil {
+		return ""
+	}
+	return sb.Meta.PolicyProfile
 }
 
 func metaAgent(sb sandbox.Sandbox) string {

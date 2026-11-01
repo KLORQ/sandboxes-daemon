@@ -12,6 +12,8 @@ import (
 	"hash/fnv"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -32,8 +34,12 @@ import (
 )
 
 const (
-	tcpProtocol = "tcp"
-	udpProtocol = "udp"
+	tcpProtocol  = "tcp"
+	udpProtocol  = "udp"
+	tcp4Protocol = "tcp4"
+	udp4Protocol = "udp4"
+	tcp6Protocol = "tcp6"
+	udp6Protocol = "udp6"
 )
 
 // Service coordinates durable sandbox state and operations.
@@ -46,6 +52,11 @@ type Service struct {
 	oauthVaultStore     oauthsession.Vault
 	dockerHubAuth       http.RoundTripper
 	DefaultImage        string
+	DefaultCPUs         uint32
+	DefaultMemoryMiB    uint32
+	DockerVolumeDir     string
+	DockerVolumeSize    string
+	MkfsExt4            string
 	now                 func() time.Time
 	createGates         [64]chan struct{}
 	lifecycleGates      [64]chan struct{}
@@ -518,13 +529,16 @@ func registryGateKey(registry string) string {
 
 // New creates a control-plane service.
 func New(st *store.Store, backend runtime.Backend) *Service {
+	cpus, memoryMiB := hostResourceDefaults()
 	s := &Service{
-		store:         st,
-		journal:       operation.NewJournal(st.Operations()),
-		backend:       backend,
-		DefaultImage:  "alpine:3.22",
-		now:           time.Now,
-		dockerHubAuth: oauthsession.NewDockerHubAuthTransport(),
+		store:            st,
+		journal:          operation.NewJournal(st.Operations()),
+		backend:          backend,
+		DefaultImage:     "alpine:3.22",
+		DefaultCPUs:      cpus,
+		DefaultMemoryMiB: memoryMiB,
+		now:              time.Now,
+		dockerHubAuth:    oauthsession.NewDockerHubAuthTransport(),
 	}
 	for i := range s.createGates {
 		s.createGates[i] = make(chan struct{}, 1)
@@ -541,19 +555,23 @@ type CreateRequest struct {
 	Workspace      string
 	IdempotencyKey string
 	// Zero selects the daemon default.
-	CPUs       uint32
-	MemoryMiB  uint32
-	Workspaces []sandbox.Workspace
-	Ports      []sandbox.Port
-	Allow      []sandbox.NetworkRule
-	Deny       []sandbox.NetworkRule
-	Agent      string
-	Detached   bool
+	CPUs          uint32
+	MemoryMiB     uint32
+	Workspaces    []sandbox.Workspace
+	Ports         []sandbox.Port
+	Allow         []sandbox.NetworkRule
+	Deny          []sandbox.NetworkRule
+	Agent         string
+	Detached      bool
+	PolicyProfile string
+	Privileged    bool
 	// Env is baked into the sandbox runtime; it is never written to SQLite.
 	Env map[string]string
 }
 
 // Create creates a stopped sandbox and a completed create operation.
+//
+//nolint:gocyclo,cyclop,gocognit,funlen // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Operation, error) {
 	name := strings.TrimSpace(req.Name)
 	if !validSandboxName(name) {
@@ -572,7 +590,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	ports, allow, deny, err := normalizeCreateNetwork(req)
+	profile, ports, allow, deny, err := s.normalizeCreatePolicy(ctx, req)
 	if err != nil {
 		return operation.Operation{}, err
 	}
@@ -580,14 +598,10 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		name: name, image: image, workspace: workspace, workspaces: workspaces, ports: ports,
 		allow: allow, deny: deny, agent: req.Agent, detached: req.Detached, cpus: cpus, memoryMiB: memoryMiB,
 	}
-	if req.IdempotencyKey != "" {
-		existing, err := s.replayCreate(ctx, req.IdempotencyKey, intent)
-		if err == nil {
-			return existing, nil
-		}
-		if !errors.Is(err, core.ErrNotFound) {
-			return operation.Operation{}, err
-		}
+	if existing, found, err := s.replayCreateIfRequested(ctx, req.IdempotencyKey, intent); err != nil {
+		return operation.Operation{}, err
+	} else if found {
+		return existing, nil
 	}
 	if err := s.ensureNameAvailable(ctx, name); err != nil {
 		return operation.Operation{}, err
@@ -601,28 +615,51 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
+	if !req.Privileged {
+		if inspector, ok := s.backend.(runtime.ImageInspector); ok {
+			if labels, err := inspector.ImageLabels(ctx, image); err == nil && labels["com.docker.sandboxes.start-docker"] == "true" {
+				req.Privileged = true
+			}
+		}
+	}
+	var blockVolumes []runtime.BlockVolume
+	if req.Privileged {
+		volume, err := s.ensureDockerVolume(ctx, sbID)
+		if err != nil {
+			return operation.Operation{}, err
+		}
+		blockVolumes = append(blockVolumes, runtime.BlockVolume{Source: volume, Destination: "/var/lib/docker"})
+	}
 	state := sandbox.Stopped
 	var handle runtime.Handle
 	if s.backend != nil {
 		var err error
 		handle, err = s.backend.Create(ctx, runtime.Config{
-			Name:       name,
-			Image:      image,
-			Workspace:  workspace,
-			Workspaces: runtimeWorkspaces(workspaces),
-			Ports:      runtimePorts(ports),
-			Allow:      runtimeRules(allow),
-			Deny:       runtimeRules(deny),
-			CPUs:       uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
-			MemoryMiB:  memoryMiB,
-			Env:        env,
+			Name:         name,
+			Image:        image,
+			Workspace:    workspace,
+			Workspaces:   runtimeWorkspaces(workspaces),
+			BlockVolumes: blockVolumes,
+			Ports:        runtimePorts(ports),
+			Allow:        runtimeRules(allow),
+			Deny:         runtimeRules(deny),
+			CPUs:         uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
+			MemoryMiB:    memoryMiB,
+			Env:          env,
+			Privileged:   req.Privileged,
 		})
 		if err != nil {
 			return operation.Operation{}, err
 		}
+		if err := s.ensureDockerProfile(ctx, req.Privileged, handle); err != nil {
+			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")))
+		}
 		state = sandbox.Running
 	}
-	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, cpus, memoryMiB, now)
+	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, profile, cpus, memoryMiB, now)
+	if err := s.setDockerProfile(ctx, sbID, req.Privileged); err != nil {
+		return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
+	}
 	op := operation.Operation{
 		ID:             opID,
 		SandboxID:      sbID,
@@ -639,6 +676,20 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	return op, nil
 }
 
+func (s *Service) replayCreateIfRequested(ctx context.Context, key string, intent createIntent) (operation.Operation, bool, error) {
+	if key == "" {
+		return operation.Operation{}, false, nil
+	}
+	existing, err := s.replayCreate(ctx, key, intent)
+	if err == nil {
+		return existing, true, nil
+	}
+	if !errors.Is(err, core.ErrNotFound) {
+		return operation.Operation{}, false, err
+	}
+	return operation.Operation{}, false, nil
+}
+
 func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uint32, []string, error) {
 	image := req.Image
 	if image == "" {
@@ -646,7 +697,13 @@ func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uin
 	}
 	cpus, memoryMiB := req.CPUs, req.MemoryMiB
 	if cpus == 0 {
+		cpus = s.DefaultCPUs
+	}
+	if cpus == 0 {
 		cpus = 2
+	}
+	if memoryMiB == 0 {
+		memoryMiB = s.DefaultMemoryMiB
 	}
 	if memoryMiB == 0 {
 		memoryMiB = 1024
@@ -672,7 +729,7 @@ func normalizeCreateWorkspaces(req CreateRequest) (string, []sandbox.Workspace, 
 	return workspaces[0].Path, workspaces, nil
 }
 
-func newSandboxRecord(id, name string, state sandbox.State, image, workspace string, workspaces []sandbox.Workspace, ports []sandbox.Port, allow, deny []sandbox.NetworkRule, agent string, detached bool, cpus, memoryMiB uint32, now time.Time) sandbox.Sandbox {
+func newSandboxRecord(id, name string, state sandbox.State, image, workspace string, workspaces []sandbox.Workspace, ports []sandbox.Port, allow, deny []sandbox.NetworkRule, agent string, detached bool, profile string, cpus, memoryMiB uint32, now time.Time) sandbox.Sandbox {
 	stoppedAt := time.Time{}
 	if state == sandbox.Stopped {
 		stoppedAt = now
@@ -680,7 +737,7 @@ func newSandboxRecord(id, name string, state sandbox.State, image, workspace str
 	return sandbox.Sandbox{
 		ID: id, Name: name, State: state, Generation: 1, Image: image,
 		Workspace: workspace, Workspaces: workspaces, Ports: ports, Policy: networkPolicy(allow, deny),
-		Meta: &sandbox.Meta{Agent: agent, Detached: detached, LastUsedAt: now},
+		Meta: &sandbox.Meta{Agent: agent, Detached: detached, PolicyProfile: profile, LastUsedAt: now},
 		CPUs: cpus, MemoryMiB: memoryMiB, StoppedAt: stoppedAt, CreatedAt: now, UpdatedAt: now,
 	}
 }
@@ -726,13 +783,13 @@ func normalizePorts(ports []sandbox.Port) ([]sandbox.Port, error) {
 		if port.Host == 0 || port.Guest == 0 {
 			return nil, fmt.Errorf("%w: host and guest ports must be non-zero", core.ErrConflict)
 		}
-		if port.Protocol == "" {
-			port.Protocol = tcpProtocol
+		protocol, hostIP, err := normalizePortEndpoint(port.Protocol, port.HostIP)
+		if err != nil {
+			return nil, err
 		}
-		if port.Protocol != tcpProtocol && port.Protocol != udpProtocol {
-			return nil, fmt.Errorf("%w: port protocol must be tcp or udp", core.ErrConflict)
-		}
-		key := port.Protocol + ":" + strconv.Itoa(int(port.Host))
+		port.Protocol = protocol
+		port.HostIP = hostIP
+		key := port.Protocol + ":" + port.HostIP + ":" + strconv.Itoa(int(port.Host))
 		if _, exists := seen[key]; exists {
 			return nil, fmt.Errorf("%w: duplicate host port", core.ErrConflict)
 		}
@@ -742,12 +799,65 @@ func normalizePorts(ports []sandbox.Port) ([]sandbox.Port, error) {
 	return out, nil
 }
 
+func normalizePortEndpoint(protocol, hostIP string) (string, string, error) {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "" {
+		protocol = tcpProtocol
+	}
+	explicitFamily := ""
+	switch protocol {
+	case tcpProtocol, udpProtocol:
+	case tcp4Protocol, udp4Protocol:
+		explicitFamily = "4"
+		if protocol == tcp4Protocol {
+			protocol = tcpProtocol
+		} else {
+			protocol = udpProtocol
+		}
+	case tcp6Protocol, udp6Protocol:
+		explicitFamily = "6"
+		if protocol == tcp6Protocol {
+			protocol = tcpProtocol
+		} else {
+			protocol = udpProtocol
+		}
+	default:
+		return "", "", fmt.Errorf("%w: port protocol must be tcp, udp, tcp4, udp4, tcp6 or udp6", core.ErrConflict)
+	}
+	if hostIP == "" {
+		hostIP = "127.0.0.1"
+		if explicitFamily == "6" {
+			hostIP = "::1"
+		}
+	}
+	ip := net.ParseIP(hostIP)
+	if ip == nil || !ip.IsLoopback() {
+		return "", "", fmt.Errorf("%w: host IP must be loopback (127.0.0.1 or ::1)", core.ErrConflict)
+	}
+	family := "4"
+	if ip.To4() == nil {
+		family = "6"
+	}
+	if explicitFamily != "" && explicitFamily != family {
+		return "", "", fmt.Errorf("%w: host IP family does not match port protocol", core.ErrConflict)
+	}
+	return protocol, ip.String(), nil
+}
+
 func runtimePorts(ports []sandbox.Port) []runtime.Port {
 	out := make([]runtime.Port, 0, len(ports))
 	for i := range ports {
-		out = append(out, runtime.Port{Host: ports[i].Host, Guest: ports[i].Guest, Protocol: ports[i].Protocol})
+		out = append(out, runtime.Port{Host: ports[i].Host, Guest: ports[i].Guest, Protocol: ports[i].Protocol, HostIP: ports[i].HostIP})
 	}
 	return out
+}
+
+func portConflictKey(port sandbox.Port) string {
+	hostIP := port.HostIP
+	if hostIP == "" {
+		hostIP = "127.0.0.1"
+	}
+	return port.Protocol + ":" + hostIP + ":" + strconv.Itoa(int(port.Host))
 }
 
 func sandboxAgent(sb sandbox.Sandbox) string {
@@ -778,26 +888,48 @@ func normalizeCreateNetwork(req CreateRequest) ([]sandbox.Port, []sandbox.Networ
 
 func checkHostPorts(ports []sandbox.Port) error {
 	for _, port := range ports {
-		address := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port.Host)))
-		var closeProbe func() error
-		if port.Protocol == udpProtocol {
-			packet, err := net.ListenPacket("udp4", address)
-			if err != nil {
-				return fmt.Errorf("%w: host port %d/%s is already in use", core.ErrConflict, port.Host, port.Protocol)
-			}
-			closeProbe = packet.Close
-		} else {
-			listener, err := net.Listen("tcp4", address)
-			if err != nil {
-				return fmt.Errorf("%w: host port %d/%s is already in use", core.ErrConflict, port.Host, port.Protocol)
-			}
-			closeProbe = listener.Close
+		closeProbe, err := probeHostPort(port)
+		if err != nil {
+			return err
 		}
 		if err := closeProbe(); err != nil {
 			return fmt.Errorf("release host port %d probe: %w", port.Host, err)
 		}
 	}
 	return nil
+}
+
+func probeHostPort(port sandbox.Port) (func() error, error) {
+	address := net.JoinHostPort(port.HostIP, strconv.Itoa(int(port.Host)))
+	network := tcp4Protocol
+	if net.ParseIP(port.HostIP).To4() == nil {
+		network = tcp6Protocol
+	}
+	if port.Protocol == udpProtocol {
+		if network == tcp6Protocol {
+			network = udp6Protocol
+		} else {
+			network = udp4Protocol
+		}
+		packet, err := net.ListenPacket(network, address)
+		if err != nil {
+			return nil, hostPortProbeError(port, err)
+		}
+		return packet.Close, nil
+	}
+	listener, err := net.Listen(network, address)
+	if err != nil {
+		return nil, hostPortProbeError(port, err)
+	}
+	return listener.Close, nil
+}
+
+func hostPortProbeError(port sandbox.Port, err error) error {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "address already in use") || strings.Contains(message, "address in use") {
+		return fmt.Errorf("%w: host port %s:%d/%s is already in use", core.ErrConflict, port.HostIP, port.Host, port.Protocol)
+	}
+	return fmt.Errorf("%w: host port %s:%d/%s is unavailable: %w", core.ErrConflict, port.HostIP, port.Host, port.Protocol, err)
 }
 
 func normalizeCreateRules(req CreateRequest) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
@@ -821,7 +953,7 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 		if rule.Protocol == "" {
 			rule.Protocol = tcpProtocol
 		}
-		if rule.Protocol != tcpProtocol && rule.Protocol != "udp" {
+		if rule.Protocol != tcpProtocol && rule.Protocol != udpProtocol {
 			return nil, fmt.Errorf("%w: network rule protocol must be tcp or udp", core.ErrConflict)
 		}
 		ip, _, err := net.ParseCIDR(rule.CIDR)
@@ -1031,6 +1163,270 @@ func createEnvNameChar(c byte) bool {
 	return createEnvNameStart(c) || (c >= '0' && c <= '9')
 }
 
+const (
+	policyProfileSetting  = "policy.profile"
+	policyProfileDenyAll  = "deny-all"
+	policyProfileBalanced = "balanced"
+	policyProfileAllowAll = "allow-all"
+	anyIPv4CIDR           = "0.0.0.0/0"
+)
+
+func (s *Service) normalizeCreatePolicy(ctx context.Context, req CreateRequest) (string, []sandbox.Port, []sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	ports, allow, deny, err := normalizeCreateNetwork(req)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	profile, rules, err := s.resolveCreateProfile(ctx, req.PolicyProfile)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	return profile, ports, mergePolicyRules(rules, allow), deny, nil
+}
+
+// GetPolicyProfile returns the global default profile for new sandboxes.
+func (s *Service) GetPolicyProfile(ctx context.Context) (string, error) {
+	profile, err := s.store.GetSetting(ctx, policyProfileSetting)
+	if errors.Is(err, core.ErrNotFound) {
+		return policyProfileDenyAll, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if profile == "" {
+		return policyProfileDenyAll, nil
+	}
+	return profile, nil
+}
+
+// SetPolicyProfile stores the global default profile for new sandboxes.
+func (s *Service) SetPolicyProfile(ctx context.Context, profile string) (string, error) {
+	profile, _, err := normalizePolicyProfile(profile)
+	if err != nil {
+		return "", err
+	}
+	if err := s.store.SetSetting(ctx, policyProfileSetting, profile); err != nil {
+		return "", err
+	}
+	return profile, nil
+}
+
+func (s *Service) resolveCreateProfile(ctx context.Context, requested string) (string, []sandbox.NetworkRule, error) {
+	profile := requested
+	if profile == "" {
+		var err error
+		profile, err = s.GetPolicyProfile(ctx)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	normalized, rules, err := normalizePolicyProfile(profile)
+	if err != nil {
+		return "", nil, err
+	}
+	return normalized, rules, nil
+}
+
+func normalizePolicyProfile(profile string) (string, []sandbox.NetworkRule, error) {
+	switch profile {
+	case "", policyProfileDenyAll:
+		return policyProfileDenyAll, nil, nil
+	case policyProfileAllowAll, "sbx-compat":
+		return policyProfileAllowAll, []sandbox.NetworkRule{
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR},
+			{Protocol: "udp", CIDR: anyIPv4CIDR},
+		}, nil
+	case policyProfileBalanced:
+		return policyProfileBalanced, []sandbox.NetworkRule{
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR, Port: 80},
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR, Port: 443},
+			{Protocol: tcpProtocol, CIDR: anyIPv4CIDR, Port: 53},
+			{Protocol: "udp", CIDR: anyIPv4CIDR, Port: 53},
+		}, nil
+	default:
+		return "", nil, fmt.Errorf("%w: unknown policy profile", core.ErrConflict)
+	}
+}
+
+func mergePolicyRules(profile, explicit []sandbox.NetworkRule) []sandbox.NetworkRule {
+	out := append([]sandbox.NetworkRule(nil), profile...)
+	seen := make(map[sandbox.NetworkRule]struct{}, len(out))
+	for _, rule := range out {
+		seen[rule] = struct{}{}
+	}
+	for _, rule := range explicit {
+		if _, exists := seen[rule]; exists {
+			continue
+		}
+		seen[rule] = struct{}{}
+		out = append(out, rule)
+	}
+	return out
+}
+
+func (s *Service) setDockerProfile(ctx context.Context, id string, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	return s.store.SetSetting(ctx, dockerSettingKey(id), "true")
+}
+
+func (s *Service) startRuntimeSandbox(ctx context.Context, sb sandbox.Sandbox) error {
+	handle := s.backend.Handle(sb.Name)
+	handle.Ports = runtimePorts(sb.Ports)
+	handle.Allow = runtimeRules(policyAllow(sb.Policy))
+	handle.Deny = runtimeRules(policyDeny(sb.Policy))
+	if err := s.backend.Start(ctx, handle); err != nil {
+		return err
+	}
+	enabled, err := s.dockerProfileEnabled(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return nil
+	}
+	return s.startDockerProfile(ctx, handle)
+}
+
+func dockerSettingKey(id string) string { return "sandbox.docker." + id }
+
+func (s *Service) dockerProfileEnabled(ctx context.Context, id string) (bool, error) {
+	value, err := s.store.GetSetting(ctx, dockerSettingKey(id))
+	if errors.Is(err, core.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return value == "true", nil
+}
+
+func (s *Service) resolveMkfs() string {
+	if s.MkfsExt4 != "mkfs.ext4" {
+		return s.MkfsExt4
+	}
+	if resolved, err := exec.LookPath(s.MkfsExt4); err == nil {
+		return resolved
+	}
+	for _, candidate := range []string{
+		"/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+		"/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+		"/sbin/mkfs.ext4",
+		"/usr/sbin/mkfs.ext4",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return s.MkfsExt4
+}
+
+func (s *Service) removeDockerVolume(id string) error {
+	if s.DockerVolumeDir == "" {
+		return nil
+	}
+	err := os.Remove(filepath.Join(s.DockerVolumeDir, id+".ext4"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove docker volume: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) ensureDockerVolume(ctx context.Context, id string) (string, error) {
+	if s.DockerVolumeDir == "" {
+		return "", errors.New("docker volume directory is not configured")
+	}
+	if err := os.MkdirAll(s.DockerVolumeDir, 0o700); err != nil {
+		return "", fmt.Errorf("create docker volume directory: %w", err)
+	}
+	path := filepath.Join(s.DockerVolumeDir, id+".ext4")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat docker volume: %w", err)
+	}
+	size, err := parseVolumeSize(s.DockerVolumeSize)
+	if err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600) //nolint:gosec // path is generated from the trusted state directory and sandbox ID
+	if err != nil {
+		return "", fmt.Errorf("create docker volume: %w", err)
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("size docker volume: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close docker volume: %w", err)
+	}
+	mkfs := s.resolveMkfs()
+	command := exec.CommandContext(ctx, mkfs, "-q", "-F", path) // #nosec G204 -- operator-configured binary and generated path
+	if output, err := command.CombinedOutput(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("mkfs docker volume: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return path, nil
+}
+
+func parseVolumeSize(value string) (int64, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		value = "10g"
+	}
+	multiplier := int64(1)
+	switch value[len(value)-1] {
+	case 'g':
+		multiplier = 1 << 30
+		value = value[:len(value)-1]
+	case 'm':
+		multiplier = 1 << 20
+		value = value[:len(value)-1]
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid docker volume size %q", value)
+	}
+	size := n * multiplier
+	if size < 512<<20 {
+		return 0, fmt.Errorf("docker volume size must be at least 512 MiB")
+	}
+	return size, nil
+}
+
+func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, handle runtime.Handle) error {
+	if !enabled {
+		return nil
+	}
+	return s.startDockerProfile(ctx, handle)
+}
+
+func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle) error {
+	native, ok := s.backend.(runtime.NativeExecutor)
+	if !ok {
+		return errors.New("runtime does not support native docker profile startup")
+	}
+	script := `mkdir -p /sys/fs/cgroup
+mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
+mount -o remount,rw /proc/sys 2>/dev/null || true
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+setsid dockerd --host=unix:///var/run/docker.sock >/var/log/dockerd.log 2>&1 &
+for i in $(seq 1 50); do docker info >/dev/null 2>&1 && exit 0; sleep 0.2; done
+exit 1
+`
+	if code, err := native.ExecNative(ctx, handle, runtime.ExecRequest{
+		Argv: []string{"/bin/sh", "-c", script}, User: "0:0",
+	}); err != nil || code != 0 {
+		return fmt.Errorf("start dockerd: code=%d err=%w", code, err)
+	}
+	return nil
+}
+
 type createIntent struct {
 	name       string
 	image      string
@@ -1139,11 +1535,7 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
 	if s.backend != nil {
-		handle := s.backend.Handle(sb.Name)
-		handle.Ports = runtimePorts(sb.Ports)
-		handle.Allow = runtimeRules(policyAllow(sb.Policy))
-		handle.Deny = runtimeRules(policyDeny(sb.Policy))
-		if err := s.backend.Start(ctx, handle); err != nil {
+		if err := s.startRuntimeSandbox(ctx, sb); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
@@ -1172,12 +1564,12 @@ func (s *Service) UpdatePorts(ctx context.Context, id string, ports []sandbox.Po
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
-	existing := make(map[uint16]struct{}, len(sb.Ports))
+	existing := make(map[string]struct{}, len(sb.Ports))
 	for _, port := range sb.Ports {
-		existing[port.Host] = struct{}{}
+		existing[portConflictKey(port)] = struct{}{}
 	}
 	for _, port := range normalized {
-		if _, ok := existing[port.Host]; ok {
+		if _, ok := existing[portConflictKey(port)]; ok {
 			continue
 		}
 		if err := checkHostPorts([]sandbox.Port{port}); err != nil {
@@ -1354,6 +1746,8 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 }
 
 // Delete removes a sandbox.
+//
+//nolint:gocyclo,cyclop // Delete orchestrates runtime teardown, persistence and volume cleanup.
 func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.Operation, error) {
 	release, err := s.acquireLifecycle(ctx, id)
 	if err != nil {
@@ -1396,6 +1790,9 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 		return operation.Operation{}, err
 	}
 	if err := s.cleanupSandboxRegistryCredentials(ctx, sb.Name); err != nil {
+		return op, err
+	}
+	if err := s.removeDockerVolume(id); err != nil {
 		return op, err
 	}
 	return op, nil

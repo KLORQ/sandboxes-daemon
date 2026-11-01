@@ -33,7 +33,7 @@ func New(manager Manager, auditDir string) *Adapter {
 func (a *Adapter) Start(ctx context.Context, sandbox string, ports []runtime.Port, allow, deny []runtime.Rule) (runtime.NetworkAttachment, error) {
 	policyPorts := make([]policy.Port, 0, len(ports))
 	for _, port := range ports {
-		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol})
+		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol, HostIP: port.HostIP})
 	}
 	net, err := a.manager.Start(ctx, policy.Policy{
 		Revision:  1,
@@ -59,7 +59,7 @@ func (a *Adapter) Start(ctx context.Context, sandbox string, ports []runtime.Por
 func (a *Adapter) UpdatePolicy(ctx context.Context, sandbox string, ports []runtime.Port, allow, deny []runtime.Rule, revision int) error {
 	policyPorts := make([]policy.Port, 0, len(ports))
 	for _, port := range ports {
-		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol})
+		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol, HostIP: port.HostIP})
 	}
 	return a.manager.Reload(ctx, policy.Policy{
 		Revision:  revision,
@@ -74,7 +74,7 @@ func (a *Adapter) UpdatePolicy(ctx context.Context, sandbox string, ports []runt
 func (a *Adapter) UpdatePorts(ctx context.Context, sandbox string, ports []runtime.Port) error {
 	policyPorts := make([]policy.Port, 0, len(ports))
 	for _, port := range ports {
-		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol})
+		policyPorts = append(policyPorts, policy.Port{Host: port.Host, Guest: port.Guest, Proto: port.Protocol, HostIP: port.HostIP})
 	}
 	return a.manager.SetPorts(ctx, sandbox, policyPorts)
 }

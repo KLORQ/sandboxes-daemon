@@ -246,6 +246,14 @@ func (f *fakeRuntime) Create(_ context.Context, cfg runtime.Config) (runtime.Han
 	}
 	return runtime.Handle{ID: "klorq-" + cfg.Name}, nil
 }
+func (f *fakeRuntime) Exec(context.Context, runtime.Handle, runtime.ExecRequest) (int, error) {
+	return 0, nil
+}
+
+func (f *fakeRuntime) ExecNative(context.Context, runtime.Handle, runtime.ExecRequest) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeRuntime) Start(_ context.Context, h runtime.Handle) error {
 	f.started++
 	f.lastHandle = h
@@ -606,8 +614,8 @@ func TestCreatePassesResourceOverridesAndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	sb, err = svc.Get(ctx, op.SandboxID)
-	if err != nil || sb.CPUs != 2 || sb.MemoryMiB != 1024 {
-		t.Fatalf("defaults = %+v, %v", sb, err)
+	if err != nil || sb.CPUs != svc.DefaultCPUs || sb.MemoryMiB != svc.DefaultMemoryMiB {
+		t.Fatalf("defaults = %+v, %v (want %d CPU/%d MiB)", sb, err, svc.DefaultCPUs, svc.DefaultMemoryMiB)
 	}
 	for _, req := range []CreateRequest{{Name: "bad-cpu", CPUs: 65}, {Name: "bad-memory", MemoryMiB: 64}} {
 		if _, err := svc.Create(ctx, req); err == nil {
@@ -730,6 +738,45 @@ func TestCreateRejectsInvalidPorts(t *testing.T) {
 		if _, err := svc.Create(ctx, CreateRequest{Name: "bad", Ports: ports}); err == nil {
 			t.Fatalf("invalid ports accepted: %+v", ports)
 		}
+	}
+}
+
+func TestNormalizePortsHostIPAndFamily(t *testing.T) {
+	ports, err := normalizePorts([]sandbox.Port{
+		{Host: 8080, Guest: 3000, Protocol: "tcp4"},
+		{Host: 8080, Guest: 3001, Protocol: "tcp6"},
+		{Host: 8080, Guest: 3002, Protocol: "udp6"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ports[0].HostIP != "127.0.0.1" || ports[1].HostIP != "::1" || ports[2].HostIP != "::1" || ports[2].Protocol != "udp" {
+		t.Fatalf("ports=%+v", ports)
+	}
+	for _, invalid := range [][]sandbox.Port{
+		{{Host: 8080, Guest: 3000, HostIP: "192.0.2.10"}},
+		{{Host: 8080, Guest: 3000, Protocol: "tcp4", HostIP: "::1"}},
+		{{Host: 8080, Guest: 3000, Protocol: "tcp6", HostIP: "127.0.0.1"}},
+		{{Host: 8080, Guest: 3000, HostIP: "127.0.0.1"}, {Host: 8080, Guest: 4000, HostIP: "127.0.0.1"}},
+	} {
+		if _, err := normalizePorts(invalid); err == nil {
+			t.Fatalf("invalid ports accepted: %+v", invalid)
+		}
+	}
+}
+
+func TestProbeHostPortIPv6UDPUsesUDP6(t *testing.T) {
+	probe, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 UDP loopback unavailable: %v", err)
+	}
+	_ = probe.Close()
+	closeProbe, err := probeHostPort(sandbox.Port{Host: 26759, Guest: 8083, Protocol: "udp", HostIP: "::1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closeProbe(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1080,5 +1127,62 @@ func TestRegistryCredentialListAndSandboxCleanup(t *testing.T) {
 	items, err = svc.ListRegistryCredentials(ctx)
 	if err != nil || len(items) != 0 {
 		t.Fatalf("items after delete=%+v err=%v", items, err)
+	}
+}
+
+func TestPolicyProfileGlobalAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "profiles.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	if profile, err := svc.GetPolicyProfile(ctx); err != nil || profile != "deny-all" {
+		t.Fatalf("default profile=%q err=%v", profile, err)
+	}
+	if profile, err := svc.SetPolicyProfile(ctx, "balanced"); err != nil || profile != "balanced" {
+		t.Fatalf("set profile=%q err=%v", profile, err)
+	}
+	op, err := svc.Create(ctx, CreateRequest{Name: "profile-default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := svc.Get(ctx, op.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Meta == nil || sb.Meta.PolicyProfile != "balanced" {
+		t.Fatalf("metadata=%+v", sb.Meta)
+	}
+	if len(backend.lastConfig.Allow) != 4 {
+		t.Fatalf("profile rules=%+v", backend.lastConfig.Allow)
+	}
+	if profile, err := svc.SetPolicyProfile(ctx, "sbx-compat"); err != nil || profile != "allow-all" {
+		t.Fatalf("alias profile=%q err=%v", profile, err)
+	}
+	if _, err := svc.SetPolicyProfile(ctx, "unknown"); err == nil {
+		t.Fatal("unknown profile accepted")
+	}
+}
+
+func TestCreatePassesPrivileged(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "priv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	svc.DockerVolumeDir = t.TempDir()
+	svc.DockerVolumeSize = "512m"
+	svc.MkfsExt4 = "true"
+	if _, err := svc.Create(ctx, CreateRequest{Name: "priv", Privileged: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !backend.lastConfig.Privileged {
+		t.Fatal("privileged request did not reach runtime")
 	}
 }
