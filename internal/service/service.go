@@ -634,6 +634,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		state = sandbox.Running
 	}
 	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, profile, cpus, memoryMiB, now)
+	if req.Privileged {
+		if err := s.store.SetSetting(ctx, dockerSettingKey(sbID), "true"); err != nil {
+			return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
+		}
+	}
 	op := operation.Operation{
 		ID:             opID,
 		SandboxID:      sbID,
@@ -1237,6 +1242,19 @@ func mergePolicyRules(profile, explicit []sandbox.NetworkRule) []sandbox.Network
 	return out
 }
 
+func dockerSettingKey(id string) string { return "sandbox.docker." + id }
+
+func (s *Service) dockerProfileEnabled(ctx context.Context, id string) (bool, error) {
+	value, err := s.store.GetSetting(ctx, dockerSettingKey(id))
+	if errors.Is(err, core.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return value == "true", nil
+}
+
 func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, handle runtime.Handle) error {
 	if !enabled {
 		return nil
@@ -1379,6 +1397,15 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		handle.Deny = runtimeRules(policyDeny(sb.Policy))
 		if err := s.backend.Start(ctx, handle); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+		}
+		enabled, err := s.dockerProfileEnabled(ctx, id)
+		if err != nil {
+			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+		}
+		if enabled {
+			if err := s.startDockerProfile(ctx, handle); err != nil {
+				return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+			}
 		}
 	}
 	op, err := s.apply(ctx, sb, operation.KindStart, sandbox.Running)
