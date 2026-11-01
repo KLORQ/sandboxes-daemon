@@ -51,6 +51,7 @@ func main() {
 func run() int {
 	if len(os.Args) > 1 && os.Args[1] == gateway.SupervisorArgument {
 		if err := gateway.RunSupervisor(os.Args[2:]); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "gateway supervisor:", err)
 			return 1
 		}
 		return 0
@@ -60,7 +61,8 @@ func run() int {
 		_, _ = fmt.Fprintln(os.Stdout, version.Version)
 		return 0
 	}
-	backend, cleanup, err := buildBackend(opts)
+	lost := make(chan string, 8)
+	backend, cleanup, err := buildBackend(opts, lost)
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -79,6 +81,7 @@ func run() int {
 		DefaultCPUs:          opts.defaultCPUs,
 		DefaultMemoryMiB:     opts.defaultMemoryMiB,
 		DockerVolumeSize:     opts.dockerVolumeSize,
+		GatewayLost:          lost,
 	})
 	if err != nil {
 		slog.Error("daemon stopped", "error", err)
@@ -138,7 +141,7 @@ func dockerOAuthProviders() map[string]service.OAuthProvider {
 	}}
 }
 
-func buildBackend(opts options) (runtime.Backend, func() error, error) {
+func buildBackend(opts options, gatewayLost chan<- string) (runtime.Backend, func() error, error) {
 	if opts.containerdPath == "" {
 		return nil, nil, nil
 	}
@@ -149,7 +152,7 @@ func buildBackend(opts options) (runtime.Backend, func() error, error) {
 	if err := os.MkdirAll(fifoDir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("create fifo dir: %w", err)
 	}
-	network, manager, err := buildNetwork(opts)
+	network, manager, err := buildNetwork(opts, gatewayLost)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,7 +178,7 @@ func buildBackend(opts options) (runtime.Backend, func() error, error) {
 	return backend, cleanup, nil
 }
 
-func buildNetwork(opts options) (runtime.Network, *gateway.Manager, error) {
+func buildNetwork(opts options, gatewayLost chan<- string) (runtime.Network, *gateway.Manager, error) {
 	if opts.gvproxyPath == "" {
 		return nil, nil, nil
 	}
@@ -192,6 +195,13 @@ func buildNetwork(opts options) (runtime.Network, *gateway.Manager, error) {
 		Supervisor:  supervisor,
 		RunDir:      runDir,
 		DNSUpstream: opts.dnsUpstream,
+		OnExit: func(name string) {
+			select {
+			case gatewayLost <- name:
+			default:
+				slog.Warn("gateway loss event dropped", "sandbox", name)
+			}
+		},
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create gateway manager: %w", err)

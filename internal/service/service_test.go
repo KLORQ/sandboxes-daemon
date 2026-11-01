@@ -1399,3 +1399,30 @@ func TestResolveProxyEnvFailsClosedUntilTransportExists(t *testing.T) {
 		t.Fatalf("env=%q err=%v", env, err)
 	}
 }
+
+func TestStopSandboxByNameStopsRunningSandbox(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	op, err := svc.Create(ctx, CreateRequest{Name: "lost-gw", Image: "scratch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Start(ctx, op.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.StopSandboxByName(ctx, "lost-gw"); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := svc.Get(ctx, op.SandboxID)
+	if err != nil || sb.State != sandbox.Stopped {
+		t.Fatalf("sandbox after gateway loss = %+v, %v", sb, err)
+	}
+	if err := svc.StopSandboxByName(ctx, "missing"); err != nil {
+		t.Fatalf("missing sandbox must be ignored: %v", err)
+	}
+}

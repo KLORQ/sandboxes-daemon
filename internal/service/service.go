@@ -2092,6 +2092,24 @@ func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny
 }
 
 // Stop transitions a sandbox to stopped.
+// StopSandboxByName stops a sandbox identified by its user-visible name. It is
+// used when an external component, such as the sandbox gateway, is lost and
+// the sandbox can no longer be trusted to have working network isolation.
+func (s *Service) StopSandboxByName(ctx context.Context, name string) error {
+	sb, err := s.store.GetByName(ctx, name)
+	if err != nil {
+		if errors.Is(err, core.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if sb.State != sandbox.Running && sb.State != sandbox.Unknown && sb.State != sandbox.Stopping {
+		return nil
+	}
+	_, err = s.StopWithGrace(ctx, sb.ID, 2*time.Second)
+	return err
+}
+
 func (s *Service) Stop(ctx context.Context, id string) (operation.Operation, error) {
 	return s.StopWithGrace(ctx, id, 0)
 }
