@@ -46,7 +46,7 @@ func TestAdapterStart(t *testing.T) {
 		Annotations: []string{"net=1"},
 	}}
 	adapter := New(manager, "/tmp/audit")
-	attachment, err := adapter.Start(context.Background(), "dev", []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp"}}, []runtime.Rule{{Protocol: "tcp", CIDR: "0.0.0.0/0", Port: 443}}, nil)
+	attachment, err := adapter.Start(context.Background(), "dev", []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp", HostIP: "::1"}}, []runtime.Rule{{Protocol: "tcp", CIDR: "0.0.0.0/0", Port: 443}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestAdapterStart(t *testing.T) {
 	if manager.policy.AuditPath != filepath.Join("/tmp/audit", "dev.audit.jsonl") {
 		t.Fatalf("audit path = %s", manager.policy.AuditPath)
 	}
-	if len(manager.policy.Ports) != 1 || manager.policy.Ports[0].Host != 8080 || manager.policy.Ports[0].Guest != 3000 {
+	if len(manager.policy.Ports) != 1 || manager.policy.Ports[0].Host != 8080 || manager.policy.Ports[0].Guest != 3000 || manager.policy.Ports[0].HostIP != "::1" {
 		t.Fatalf("policy ports = %+v", manager.policy.Ports)
 	}
 	if len(manager.policy.Allow) != 1 || manager.policy.Allow[0].CIDR != "0.0.0.0/0" || manager.policy.Allow[0].Port != 443 {
@@ -81,10 +81,10 @@ func TestAdapterUpdatePolicy(t *testing.T) {
 func TestAdapterUpdatePorts(t *testing.T) {
 	manager := &fakeManager{net: gateway.Network{}}
 	adapter := New(manager, "/tmp/audit")
-	if err := adapter.UpdatePorts(context.Background(), "dev", []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp"}}); err != nil {
+	if err := adapter.UpdatePorts(context.Background(), "dev", []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp", HostIP: "::1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(manager.policy.Ports) != 1 || manager.policy.Ports[0].Host != 8080 {
+	if len(manager.policy.Ports) != 1 || manager.policy.Ports[0].Host != 8080 || manager.policy.Ports[0].HostIP != "::1" {
 		t.Fatalf("ports = %+v", manager.policy.Ports)
 	}
 }
