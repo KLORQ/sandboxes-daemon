@@ -172,6 +172,12 @@ func ensureSocketAvailable(path string) error {
 
 func configureDockerVolume(svc *service.Service, stateDir string) {
 	svc.DockerVolumeDir = filepath.Join(stateDir, "docker")
+	if svc.DockerVolumeSize == "" {
+		svc.DockerVolumeSize = "10g"
+	}
+	if svc.MkfsExt4 == "" {
+		svc.MkfsExt4 = "mkfs.ext4"
+	}
 	if value := os.Getenv("DOCKER_SANDBOXES_DOCKER_SIZE"); value != "" {
 		svc.DockerVolumeSize = value
 	}
