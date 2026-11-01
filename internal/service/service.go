@@ -591,14 +591,10 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		name: name, image: image, workspace: workspace, workspaces: workspaces, ports: ports,
 		allow: allow, deny: deny, agent: req.Agent, detached: req.Detached, cpus: cpus, memoryMiB: memoryMiB,
 	}
-	if req.IdempotencyKey != "" {
-		existing, err := s.replayCreate(ctx, req.IdempotencyKey, intent)
-		if err == nil {
-			return existing, nil
-		}
-		if !errors.Is(err, core.ErrNotFound) {
-			return operation.Operation{}, err
-		}
+	if existing, found, err := s.replayCreateIfRequested(ctx, req.IdempotencyKey, intent); err != nil {
+		return operation.Operation{}, err
+	} else if found {
+		return existing, nil
 	}
 	if err := s.ensureNameAvailable(ctx, name); err != nil {
 		return operation.Operation{}, err
@@ -632,10 +628,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		if err != nil {
 			return operation.Operation{}, err
 		}
-		if req.Privileged {
-			if err := s.startDockerProfile(ctx, handle); err != nil {
-				return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")))
-			}
+		if err := s.ensureDockerProfile(ctx, req.Privileged, handle); err != nil {
+			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")))
 		}
 		state = sandbox.Running
 	}
@@ -654,6 +648,20 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
 	}
 	return op, nil
+}
+
+func (s *Service) replayCreateIfRequested(ctx context.Context, key string, intent createIntent) (operation.Operation, bool, error) {
+	if key == "" {
+		return operation.Operation{}, false, nil
+	}
+	existing, err := s.replayCreate(ctx, key, intent)
+	if err == nil {
+		return existing, true, nil
+	}
+	if !errors.Is(err, core.ErrNotFound) {
+		return operation.Operation{}, false, err
+	}
+	return operation.Operation{}, false, nil
 }
 
 func (s *Service) resolveCreateResources(req CreateRequest) (string, uint32, uint32, []string, error) {
@@ -1227,6 +1235,13 @@ func mergePolicyRules(profile, explicit []sandbox.NetworkRule) []sandbox.Network
 		out = append(out, rule)
 	}
 	return out
+}
+
+func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, handle runtime.Handle) error {
+	if !enabled {
+		return nil
+	}
+	return s.startDockerProfile(ctx, handle)
 }
 
 func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle) error {
