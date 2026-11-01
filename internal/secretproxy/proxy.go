@@ -4,12 +4,14 @@ package secretproxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,11 @@ type proxy struct {
 	listener net.Listener
 	url      string
 }
+
+// TokenHeader carries the per-VM bearer sent by the guest proxy helper. It is
+// only meaningful on the unix-socket transport, where the socket path is
+// already scoped to one sandbox.
+const TokenHeader = "X-Klorq-Proxy-Token" //nolint:gosec // HTTP header name, not a credential.
 
 // Manager owns proxies keyed by sandbox and service.
 type Manager struct {
@@ -124,6 +131,93 @@ func portOf(listener net.Listener) string {
 		return "0"
 	}
 	return port
+}
+
+// StartUnix starts a per-sandbox proxy on a unix socket. Every request must
+// carry the per-VM token; the socket is private (0600) and owned by the run
+// directory, so the token is defense in depth rather than the only control.
+func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Service, secret, socketPath, token string) (string, error) {
+	if err := validUnixStart(ctx, sandbox, service, secret, socketPath, token); err != nil {
+		return "", err
+	}
+	upstream, err := parseUpstream(cfg.Upstream)
+	if err != nil {
+		return "", err
+	}
+	key := sandbox + "/" + service
+	m.mu.Lock()
+	if existing := m.proxies[key]; existing != nil {
+		m.mu.Unlock()
+		return existing.url, nil
+	}
+	m.mu.Unlock()
+	listener, err := listenPrivateUnix(socketPath)
+	if err != nil {
+		return "", err
+	}
+	reverse := httputil.NewSingleHostReverseProxy(upstream)
+	reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+		http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get(TokenHeader)
+		if len(got) != len(token) || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			http.Error(w, "proxy channel unauthorized", http.StatusForbidden)
+			return
+		}
+		r.Header.Del(TokenHeader)
+		r.Header.Del("Authorization")
+		r.Header.Del("X-Api-Key")
+		if cfg.Header != "" {
+			r.Header.Set(cfg.Header, cfg.Prefix+secret)
+		}
+		r.Header.Set("X-Klorq-Secret-Proxy", service)
+		reverse.ServeHTTP(w, r)
+	})
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
+	p := &proxy{server: srv, listener: listener, url: "unix:" + socketPath}
+	m.mu.Lock()
+	if existing := m.proxies[key]; existing != nil {
+		m.mu.Unlock()
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+		return existing.url, nil
+	}
+	m.proxies[key] = p
+	m.mu.Unlock()
+	go func() { _ = srv.Serve(listener) }()
+	return p.url, nil
+}
+
+func validUnixStart(ctx context.Context, sandbox, service, secret, socketPath, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if sandbox == "" || service == "" || secret == "" || socketPath == "" || len(token) < 32 {
+		return errors.New("sandbox, service, secret, socket path and a 32+ byte token are required")
+	}
+	return nil
+}
+
+func parseUpstream(raw string) (*url.URL, error) {
+	upstream, err := url.Parse(raw)
+	if err != nil || upstream.Host == "" || (upstream.Scheme != "https" && (upstream.Scheme != "http" || !isLoopbackHost(upstream.Host))) {
+		return nil, errors.New("invalid upstream")
+	}
+	return upstream, nil
+}
+
+func listenPrivateUnix(path string) (net.Listener, error) {
+	_ = os.Remove(path)
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen for proxy channel: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("protect proxy channel socket: %w", err)
+	}
+	return listener, nil
 }
 
 // StopSandbox closes every proxy owned by a sandbox.
