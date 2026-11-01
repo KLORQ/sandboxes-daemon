@@ -566,7 +566,7 @@ type CreateRequest struct {
 
 // Create creates a stopped sandbox and a completed create operation.
 //
-//nolint:gocyclo // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
+//nolint:gocyclo,cyclop // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Operation, error) {
 	name := strings.TrimSpace(req.Name)
 	if !validSandboxName(name) {
