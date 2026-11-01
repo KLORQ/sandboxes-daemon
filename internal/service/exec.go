@@ -2,14 +2,18 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
 	runtime "github.com/KLORQ/sandboxes-runtime"
+
+	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
 )
 
 type execSession struct {
@@ -49,6 +53,11 @@ func (s *Service) exec(ctx context.Context, id string, req runtime.ExecRequest, 
 	}
 	if req.Workdir == "" {
 		req.Workdir = sb.Workspace
+	}
+	req.Env, err = s.resolveSecretEnv(ctx, sb, req.Env)
+	if err != nil {
+		release()
+		return 0, err
 	}
 	execCtx, cancel := context.WithCancel(ctx)
 	for _, output := range []*io.Writer{&req.Stdout, &req.Stderr} {
@@ -153,6 +162,39 @@ func cancelableOutputs(req runtime.ExecRequest) bool {
 		}
 	}
 	return true
+}
+
+const secretRefPrefix = "${secret:"
+
+// resolveSecretEnv expands whole-value "${secret:service}" references from the
+// host vault at exec time. Only the selected process receives the value; it is
+// never written to SQLite or sandbox metadata. Sandbox scope wins over global.
+func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env []string) ([]string, error) {
+	if len(env) == 0 || s.serviceSecrets == nil {
+		return env, nil
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, value, found := strings.Cut(entry, "=")
+		if !found || !strings.HasPrefix(value, secretRefPrefix) || !strings.HasSuffix(value, "}") {
+			out = append(out, entry)
+			continue
+		}
+		service := strings.TrimSuffix(strings.TrimPrefix(value, secretRefPrefix), "}")
+		if service == "" || strings.ContainsAny(service, "/\\\x00\r\n") {
+			return nil, fmt.Errorf("%w: invalid secret reference for %s", core.ErrConflict, key)
+		}
+		secret, err := s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeSandbox, sb.Name)
+		if errors.Is(err, servicesecrets.ErrNotFound) {
+			secret, err = s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeGlobal, "")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: secret %q is unavailable", core.ErrConflict, service)
+		}
+		out = append(out, key+"="+string(secret))
+		clear(secret)
+	}
+	return out, nil
 }
 
 // cancelExecSessions is called with the sandbox lifecycle gate held.

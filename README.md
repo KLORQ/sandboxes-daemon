@@ -66,8 +66,12 @@ pulls are not wired yet.
 in the host vault, scoped globally or to one sandbox. Values are held in memory
 only for the RPC and are never returned by `List`. A non-secret SQLite index
 supports listing and sandbox-scoped cleanup; the value itself never enters the
-database, logs, argv or sandbox snapshots. Proxy/injection into guest processes
-is not implemented yet, so the CLI reports that limitation.
+database, logs, argv or sandbox snapshots. At exec time a whole-value `${secret:service}` environment reference is
+resolved from the host vault and passed only to that process; sandbox scope wins
+over global. The value is not written to SQLite or sandbox metadata. This is an
+explicit environment-injection mode: a guest root process can read its own
+environment, so it is weaker than Docker sbx's host proxy and is documented as
+such.
 
 Global network rules are stored as daemon settings, merged with each sandbox's
 explicit rules at gateway start/update, and re-applied to running sandboxes on
