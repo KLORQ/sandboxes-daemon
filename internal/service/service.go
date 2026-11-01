@@ -27,6 +27,7 @@ import (
 	core "github.com/KLORQ/sandboxes-core"
 	"github.com/KLORQ/sandboxes-core/operation"
 	"github.com/KLORQ/sandboxes-core/sandbox"
+	gatewaypolicy "github.com/KLORQ/sandboxes-gateway/policy"
 	runtime "github.com/KLORQ/sandboxes-runtime"
 
 	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
@@ -392,6 +393,58 @@ func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope
 		return true, err
 	}
 	return true, nil
+}
+
+// PolicyDecision is the gateway-consistent result of a policy check.
+type PolicyDecision struct {
+	Allowed bool
+	RuleID  string
+	Reason  string
+}
+
+// CheckPolicy evaluates stored/global rules with the same deny precedence and
+// matcher used by the gateway. It does not resolve DNS; domain checks operate
+// on the supplied hostname and CIDR checks on the supplied IP.
+func (s *Service) CheckPolicy(ctx context.Context, id, protocol, address, domain string, port uint16) (PolicyDecision, error) {
+	if protocol != tcpProtocol && protocol != udpProtocol {
+		return PolicyDecision{}, fmt.Errorf("%w: protocol must be tcp or udp", core.ErrConflict)
+	}
+	if (address == "") == (domain == "") {
+		return PolicyDecision{}, fmt.Errorf("%w: exactly one of address or domain is required", core.ErrConflict)
+	}
+	allow, deny, err := s.checkPolicyRules(ctx, id)
+	if err != nil {
+		return PolicyDecision{}, err
+	}
+	toRules := func(rules []sandbox.NetworkRule, action gatewaypolicy.Action) []gatewaypolicy.Rule {
+		out := make([]gatewaypolicy.Rule, 0, len(rules))
+		for i := range rules {
+			out = append(out, gatewaypolicy.Rule{ID: rules[i].RuleID, Action: action, Protocol: rules[i].Protocol, Domain: rules[i].Domain, CIDR: rules[i].CIDR, Port: rules[i].Port})
+		}
+		return out
+	}
+	decision := gatewaypolicy.Check(toRules(allow, gatewaypolicy.Allow), toRules(deny, gatewaypolicy.Deny), gatewaypolicy.Request{
+		Protocol: protocol, Address: address, Domain: domain, Port: port,
+	})
+	return PolicyDecision{Allowed: decision.Allow, RuleID: decision.RuleID, Reason: decision.Reason}, nil
+}
+
+// checkPolicyRules returns the effective allow/deny rules for a sandbox ID,
+// or the stored global rules when the ID is empty.
+func (s *Service) checkPolicyRules(ctx context.Context, id string) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	if id == "" {
+		allow, deny, err := s.GlobalPolicy(ctx)
+		return allow, deny, err
+	}
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	allow, deny, err := s.effectivePolicy(ctx, sb)
+	if err != nil {
+		return nil, nil, err
+	}
+	return allow, deny, nil
 }
 
 // SetDockerHubAuthTransport injects the HTTP transport used only to validate
