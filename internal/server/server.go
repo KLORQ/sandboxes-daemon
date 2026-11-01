@@ -653,3 +653,15 @@ func (s *SandboxServer) MutateGlobalPolicy(ctx context.Context, req *localv1.Mut
 	}
 	return &localv1.MutateGlobalPolicyResponse{Allow: toProtoRules(allow), Deny: toProtoRules(deny)}, nil
 }
+
+// CheckPolicy evaluates stored/global rules with the gateway matcher.
+func (s *SandboxServer) CheckPolicy(ctx context.Context, req *localv1.CheckPolicyRequest) (*localv1.CheckPolicyResponse, error) {
+	if req.GetPort() > 65535 {
+		return nil, status.Error(codes.InvalidArgument, "port must be 0..65535")
+	}
+	decision, err := s.svc.CheckPolicy(ctx, req.GetSandboxId(), req.GetProtocol(), req.GetAddress(), req.GetDomain(), uint16(req.GetPort())) //nolint:gosec // bounded above.
+	if err != nil {
+		return nil, err
+	}
+	return &localv1.CheckPolicyResponse{Allowed: decision.Allowed, RuleId: decision.RuleID, Reason: decision.Reason}, nil
+}
