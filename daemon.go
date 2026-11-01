@@ -40,6 +40,47 @@ type Config struct {
 	DefaultCPUs          uint32
 	DefaultMemoryMiB     uint32
 	DockerVolumeSize     string
+	// GatewayLost reports sandboxes whose gateway exited unexpectedly.
+	GatewayLost <-chan string
+}
+
+// configureService applies host configuration, wires credential storage and
+// starts the gateway-loss watcher.
+func configureService(ctx context.Context, cfg Config, svc *service.Service) (func() error, error) {
+	applyConfig(svc, cfg)
+	credentialCleanup, err := configureCredentialStores(svc)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.DefaultImage != "" {
+		svc.DefaultImage = cfg.DefaultImage
+	}
+	configureDockerVolume(svc, cfg.StateDir)
+	if cfg.GatewayLost != nil {
+		go recoverLostGateways(ctx, svc, cfg.GatewayLost)
+	}
+	return credentialCleanup, nil
+}
+
+// recoverLostGateways stops sandboxes whose gateway exited: the guest packet
+// socket points at the dead process, so the sandbox cannot reach the network
+// until it is started again.
+func recoverLostGateways(ctx context.Context, svc *service.Service, events <-chan string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case name := <-events:
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			err := svc.StopSandboxByName(stopCtx, name)
+			cancel()
+			if err != nil {
+				slog.Error("stop sandbox after gateway loss", "sandbox", name, "error", err)
+				continue
+			}
+			slog.Warn("sandbox stopped after gateway loss", "sandbox", name)
+		}
+	}
 }
 
 // Run starts the daemon and blocks until ctx is canceled.
@@ -63,16 +104,11 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	defer func() { _ = st.Close() }()
 
 	svc := service.New(st, cfg.Backend)
-	applyConfig(svc, cfg)
-	credentialCleanup, err := configureCredentialStores(svc)
+	credentialCleanup, err := configureService(ctx, cfg, svc)
 	if err != nil {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, credentialCleanup()) }()
-	if cfg.DefaultImage != "" {
-		svc.DefaultImage = cfg.DefaultImage
-	}
-	configureDockerVolume(svc, cfg.StateDir)
 	changed, err := svc.Reconcile(ctx)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)

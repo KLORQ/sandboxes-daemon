@@ -6,8 +6,8 @@ github.com/KLORQ/sandboxes-api v0.0.11 h1:FuJFnT/Wc2y7KmjYNTvdviXodj+46pSghuINTv
 github.com/KLORQ/sandboxes-api v0.0.11/go.mod h1:D4UcPhDDsc1XGskCIMaRrZWVblXF3mrgZC6uw4z2zC4=
 github.com/KLORQ/sandboxes-core v0.0.8 h1:7k1EVOz697VRJIVCQh6tUTL0KALECpCE2q3+Oa9PXxE=
 github.com/KLORQ/sandboxes-core v0.0.8/go.mod h1:VQ7kkoe9DxKVmrElQYUjuIBNY8t69KlVnGJeSBuP7Q4=
-github.com/KLORQ/sandboxes-gateway v0.0.9 h1:Hw7SpN39vRwmEaIj9UBW4kOzgl9imb6rNKYW7+qwLOw=
-github.com/KLORQ/sandboxes-gateway v0.0.9/go.mod h1:ZxAcLkkHJk+ref+mjb7pzEkhjTWejxnMP56IVjMWjic=
+github.com/KLORQ/sandboxes-gateway v0.0.10 h1:PLq2yjHNCNnBFLKtX3QeXe21i9I4UTtofmFXGtuctRg=
+github.com/KLORQ/sandboxes-gateway v0.0.10/go.mod h1:ZxAcLkkHJk+ref+mjb7pzEkhjTWejxnMP56IVjMWjic=
 github.com/KLORQ/sandboxes-runtime v0.0.16 h1:DGnOFjKjpqonhchQyYTI4btsQY6uogZqo+ygeFC37T4=
 github.com/KLORQ/sandboxes-runtime v0.0.16/go.mod h1:FL+nWfR3fL02gwL33KlspE5xPizgqlrSveZNv1bQPx4=
 github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 h1:0kQAzHq8vLs7Pptv+7TxjdETLf/nIqJpIB4oC6Ba4vY=
