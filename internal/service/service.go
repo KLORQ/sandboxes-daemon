@@ -1301,6 +1301,26 @@ func (s *Service) dockerProfileEnabled(ctx context.Context, id string) (bool, er
 	return value == "true", nil
 }
 
+func (s *Service) resolveMkfs() string {
+	if s.MkfsExt4 != "mkfs.ext4" {
+		return s.MkfsExt4
+	}
+	if resolved, err := exec.LookPath(s.MkfsExt4); err == nil {
+		return resolved
+	}
+	for _, candidate := range []string{
+		"/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+		"/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+		"/sbin/mkfs.ext4",
+		"/usr/sbin/mkfs.ext4",
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return s.MkfsExt4
+}
+
 func (s *Service) removeDockerVolume(id string) error {
 	if s.DockerVolumeDir == "" {
 		return nil
@@ -1345,7 +1365,8 @@ func (s *Service) ensureDockerVolume(ctx context.Context, id string) (string, er
 		_ = os.Remove(path)
 		return "", fmt.Errorf("close docker volume: %w", err)
 	}
-	command := exec.CommandContext(ctx, s.MkfsExt4, "-q", "-F", path) // #nosec G204 -- operator-configured binary and generated path
+	mkfs := s.resolveMkfs()
+	command := exec.CommandContext(ctx, mkfs, "-q", "-F", path) // #nosec G204 -- operator-configured binary and generated path
 	if output, err := command.CombinedOutput(); err != nil {
 		_ = os.Remove(path)
 		return "", fmt.Errorf("mkfs docker volume: %w: %s", err, strings.TrimSpace(string(output)))
