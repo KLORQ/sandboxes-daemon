@@ -3,10 +3,10 @@ module github.com/KLORQ/sandboxes-daemon
 go 1.27
 
 require (
-	github.com/KLORQ/sandboxes-api v0.0.6
-	github.com/KLORQ/sandboxes-core v0.0.6
-	github.com/KLORQ/sandboxes-gateway v0.0.3
-	github.com/KLORQ/sandboxes-runtime v0.0.9
+	github.com/KLORQ/sandboxes-api v0.0.7
+	github.com/KLORQ/sandboxes-core v0.0.7
+	github.com/KLORQ/sandboxes-gateway v0.0.5
+	github.com/KLORQ/sandboxes-runtime v0.0.10
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0

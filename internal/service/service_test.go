@@ -733,6 +733,45 @@ func TestCreateRejectsInvalidPorts(t *testing.T) {
 	}
 }
 
+func TestNormalizePortsHostIPAndFamily(t *testing.T) {
+	ports, err := normalizePorts([]sandbox.Port{
+		{Host: 8080, Guest: 3000, Protocol: "tcp4"},
+		{Host: 8080, Guest: 3001, Protocol: "tcp6"},
+		{Host: 8080, Guest: 3002, Protocol: "udp6"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ports[0].HostIP != "127.0.0.1" || ports[1].HostIP != "::1" || ports[2].HostIP != "::1" || ports[2].Protocol != "udp" {
+		t.Fatalf("ports=%+v", ports)
+	}
+	for _, invalid := range [][]sandbox.Port{
+		{{Host: 8080, Guest: 3000, HostIP: "192.0.2.10"}},
+		{{Host: 8080, Guest: 3000, Protocol: "tcp4", HostIP: "::1"}},
+		{{Host: 8080, Guest: 3000, Protocol: "tcp6", HostIP: "127.0.0.1"}},
+		{{Host: 8080, Guest: 3000, HostIP: "127.0.0.1"}, {Host: 8080, Guest: 4000, HostIP: "127.0.0.1"}},
+	} {
+		if _, err := normalizePorts(invalid); err == nil {
+			t.Fatalf("invalid ports accepted: %+v", invalid)
+		}
+	}
+}
+
+func TestProbeHostPortIPv6UDPUsesUDP6(t *testing.T) {
+	probe, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 UDP loopback unavailable: %v", err)
+	}
+	_ = probe.Close()
+	closeProbe, err := probeHostPort(sandbox.Port{Host: 26759, Guest: 8083, Protocol: "udp", HostIP: "::1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closeProbe(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStartPassesPublishedPortsToRuntime(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))

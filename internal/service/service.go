@@ -32,8 +32,12 @@ import (
 )
 
 const (
-	tcpProtocol = "tcp"
-	udpProtocol = "udp"
+	tcpProtocol  = "tcp"
+	udpProtocol  = "udp"
+	tcp4Protocol = "tcp4"
+	udp4Protocol = "udp4"
+	tcp6Protocol = "tcp6"
+	udp6Protocol = "udp6"
 )
 
 // Service coordinates durable sandbox state and operations.
@@ -738,13 +742,13 @@ func normalizePorts(ports []sandbox.Port) ([]sandbox.Port, error) {
 		if port.Host == 0 || port.Guest == 0 {
 			return nil, fmt.Errorf("%w: host and guest ports must be non-zero", core.ErrConflict)
 		}
-		if port.Protocol == "" {
-			port.Protocol = tcpProtocol
+		protocol, hostIP, err := normalizePortEndpoint(port.Protocol, port.HostIP)
+		if err != nil {
+			return nil, err
 		}
-		if port.Protocol != tcpProtocol && port.Protocol != udpProtocol {
-			return nil, fmt.Errorf("%w: port protocol must be tcp or udp", core.ErrConflict)
-		}
-		key := port.Protocol + ":" + strconv.Itoa(int(port.Host))
+		port.Protocol = protocol
+		port.HostIP = hostIP
+		key := port.Protocol + ":" + port.HostIP + ":" + strconv.Itoa(int(port.Host))
 		if _, exists := seen[key]; exists {
 			return nil, fmt.Errorf("%w: duplicate host port", core.ErrConflict)
 		}
@@ -754,12 +758,65 @@ func normalizePorts(ports []sandbox.Port) ([]sandbox.Port, error) {
 	return out, nil
 }
 
+func normalizePortEndpoint(protocol, hostIP string) (string, string, error) {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "" {
+		protocol = tcpProtocol
+	}
+	explicitFamily := ""
+	switch protocol {
+	case tcpProtocol, udpProtocol:
+	case tcp4Protocol, udp4Protocol:
+		explicitFamily = "4"
+		if protocol == tcp4Protocol {
+			protocol = tcpProtocol
+		} else {
+			protocol = udpProtocol
+		}
+	case tcp6Protocol, udp6Protocol:
+		explicitFamily = "6"
+		if protocol == tcp6Protocol {
+			protocol = tcpProtocol
+		} else {
+			protocol = udpProtocol
+		}
+	default:
+		return "", "", fmt.Errorf("%w: port protocol must be tcp, udp, tcp4, udp4, tcp6 or udp6", core.ErrConflict)
+	}
+	if hostIP == "" {
+		hostIP = "127.0.0.1"
+		if explicitFamily == "6" {
+			hostIP = "::1"
+		}
+	}
+	ip := net.ParseIP(hostIP)
+	if ip == nil || !ip.IsLoopback() {
+		return "", "", fmt.Errorf("%w: host IP must be loopback (127.0.0.1 or ::1)", core.ErrConflict)
+	}
+	family := "4"
+	if ip.To4() == nil {
+		family = "6"
+	}
+	if explicitFamily != "" && explicitFamily != family {
+		return "", "", fmt.Errorf("%w: host IP family does not match port protocol", core.ErrConflict)
+	}
+	return protocol, ip.String(), nil
+}
+
 func runtimePorts(ports []sandbox.Port) []runtime.Port {
 	out := make([]runtime.Port, 0, len(ports))
 	for i := range ports {
-		out = append(out, runtime.Port{Host: ports[i].Host, Guest: ports[i].Guest, Protocol: ports[i].Protocol})
+		out = append(out, runtime.Port{Host: ports[i].Host, Guest: ports[i].Guest, Protocol: ports[i].Protocol, HostIP: ports[i].HostIP})
 	}
 	return out
+}
+
+func portConflictKey(port sandbox.Port) string {
+	hostIP := port.HostIP
+	if hostIP == "" {
+		hostIP = "127.0.0.1"
+	}
+	return port.Protocol + ":" + hostIP + ":" + strconv.Itoa(int(port.Host))
 }
 
 func sandboxAgent(sb sandbox.Sandbox) string {
@@ -790,26 +847,48 @@ func normalizeCreateNetwork(req CreateRequest) ([]sandbox.Port, []sandbox.Networ
 
 func checkHostPorts(ports []sandbox.Port) error {
 	for _, port := range ports {
-		address := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port.Host)))
-		var closeProbe func() error
-		if port.Protocol == udpProtocol {
-			packet, err := net.ListenPacket("udp4", address)
-			if err != nil {
-				return fmt.Errorf("%w: host port %d/%s is already in use", core.ErrConflict, port.Host, port.Protocol)
-			}
-			closeProbe = packet.Close
-		} else {
-			listener, err := net.Listen("tcp4", address)
-			if err != nil {
-				return fmt.Errorf("%w: host port %d/%s is already in use", core.ErrConflict, port.Host, port.Protocol)
-			}
-			closeProbe = listener.Close
+		closeProbe, err := probeHostPort(port)
+		if err != nil {
+			return err
 		}
 		if err := closeProbe(); err != nil {
 			return fmt.Errorf("release host port %d probe: %w", port.Host, err)
 		}
 	}
 	return nil
+}
+
+func probeHostPort(port sandbox.Port) (func() error, error) {
+	address := net.JoinHostPort(port.HostIP, strconv.Itoa(int(port.Host)))
+	network := tcp4Protocol
+	if net.ParseIP(port.HostIP).To4() == nil {
+		network = tcp6Protocol
+	}
+	if port.Protocol == udpProtocol {
+		if network == tcp6Protocol {
+			network = udp6Protocol
+		} else {
+			network = udp4Protocol
+		}
+		packet, err := net.ListenPacket(network, address)
+		if err != nil {
+			return nil, hostPortProbeError(port, err)
+		}
+		return packet.Close, nil
+	}
+	listener, err := net.Listen(network, address)
+	if err != nil {
+		return nil, hostPortProbeError(port, err)
+	}
+	return listener.Close, nil
+}
+
+func hostPortProbeError(port sandbox.Port, err error) error {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "address already in use") || strings.Contains(message, "address in use") {
+		return fmt.Errorf("%w: host port %s:%d/%s is already in use", core.ErrConflict, port.HostIP, port.Host, port.Protocol)
+	}
+	return fmt.Errorf("%w: host port %s:%d/%s is unavailable: %w", core.ErrConflict, port.HostIP, port.Host, port.Protocol, err)
 }
 
 func normalizeCreateRules(req CreateRequest) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
@@ -1284,12 +1363,12 @@ func (s *Service) UpdatePorts(ctx context.Context, id string, ports []sandbox.Po
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
-	existing := make(map[uint16]struct{}, len(sb.Ports))
+	existing := make(map[string]struct{}, len(sb.Ports))
 	for _, port := range sb.Ports {
-		existing[port.Host] = struct{}{}
+		existing[portConflictKey(port)] = struct{}{}
 	}
 	for _, port := range normalized {
-		if _, ok := existing[port.Host]; ok {
+		if _, ok := existing[portConflictKey(port)]; ok {
 			continue
 		}
 		if err := checkHostPorts([]sandbox.Port{port}); err != nil {
