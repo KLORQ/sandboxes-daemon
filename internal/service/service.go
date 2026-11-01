@@ -571,7 +571,7 @@ type CreateRequest struct {
 
 // Create creates a stopped sandbox and a completed create operation.
 //
-//nolint:gocyclo,cyclop // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
+//nolint:gocyclo,cyclop,gocognit,funlen // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Operation, error) {
 	name := strings.TrimSpace(req.Name)
 	if !validSandboxName(name) {
@@ -1332,7 +1332,7 @@ func (s *Service) ensureDockerVolume(ctx context.Context, id string) (string, er
 	if err != nil {
 		return "", err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600) //nolint:gosec // path is generated from the trusted state directory and sandbox ID
 	if err != nil {
 		return "", fmt.Errorf("create docker volume: %w", err)
 	}
@@ -1725,6 +1725,8 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 }
 
 // Delete removes a sandbox.
+//
+//nolint:gocyclo // Delete orchestrates runtime teardown, persistence and volume cleanup.
 func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.Operation, error) {
 	release, err := s.acquireLifecycle(ctx, id)
 	if err != nil {

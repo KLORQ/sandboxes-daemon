@@ -64,13 +64,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if cfg.DefaultImage != "" {
 		svc.DefaultImage = cfg.DefaultImage
 	}
-	svc.DockerVolumeDir = filepath.Join(cfg.StateDir, "docker")
-	if value := os.Getenv("DOCKER_SANDBOXES_DOCKER_SIZE"); value != "" {
-		svc.DockerVolumeSize = value
-	}
-	if value := os.Getenv("DOCKER_SANDBOXES_MKFS_EXT4"); value != "" {
-		svc.MkfsExt4 = value
-	}
+	configureDockerVolume(svc, cfg.StateDir)
 	changed, err := svc.Reconcile(ctx)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
@@ -174,4 +168,14 @@ func ensureSocketAvailable(path string) error {
 		return fmt.Errorf("inspect daemon socket: %w", err)
 	}
 	return fmt.Errorf("daemon socket path already exists")
+}
+
+func configureDockerVolume(svc *service.Service, stateDir string) {
+	svc.DockerVolumeDir = filepath.Join(stateDir, "docker")
+	if value := os.Getenv("DOCKER_SANDBOXES_DOCKER_SIZE"); value != "" {
+		svc.DockerVolumeSize = value
+	}
+	if value := os.Getenv("DOCKER_SANDBOXES_MKFS_EXT4"); value != "" {
+		svc.MkfsExt4 = value
+	}
 }
