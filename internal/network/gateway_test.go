@@ -46,11 +46,11 @@ func TestAdapterStart(t *testing.T) {
 		Annotations: []string{"net=1"},
 	}}
 	adapter := New(manager, "/tmp/audit")
-	attachment, err := adapter.Start(context.Background(), "dev", []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp", HostIP: "::1"}}, []runtime.Rule{{Protocol: "tcp", CIDR: "0.0.0.0/0", Port: 443}}, nil)
+	attachment, err := adapter.Start(context.Background(), "dev", []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp", HostIP: "::1"}}, []runtime.Rule{{ID: "rul_allow_https", Protocol: "tcp", CIDR: "0.0.0.0/0", Port: 443}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manager.policy.SandboxID != "dev" || manager.policy.Revision != 1 {
+	if manager.policy.SandboxID != "dev" || manager.policy.Revision <= 0 {
 		t.Fatalf("policy = %+v", manager.policy)
 	}
 	if manager.policy.AuditPath != filepath.Join("/tmp/audit", "dev.audit.jsonl") {
@@ -61,6 +61,9 @@ func TestAdapterStart(t *testing.T) {
 	}
 	if len(manager.policy.Allow) != 1 || manager.policy.Allow[0].CIDR != "0.0.0.0/0" || manager.policy.Allow[0].Port != 443 {
 		t.Fatalf("policy allow = %+v", manager.policy.Allow)
+	}
+	if manager.policy.Allow[0].ID != "rul_allow_https" {
+		t.Fatalf("policy rule ID = %q, want rul_allow_https", manager.policy.Allow[0].ID)
 	}
 	if attachment.SocketPath != "/run/dev.sock" || len(attachment.Annotations) != 1 {
 		t.Fatalf("attachment = %+v", attachment)

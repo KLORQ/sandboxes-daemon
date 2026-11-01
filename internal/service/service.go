@@ -1156,6 +1156,11 @@ func validateDomainPattern(pattern string) error {
 	if pattern == "" || len(pattern) > 253 || strings.ContainsAny(pattern, "\\ ") {
 		return fmt.Errorf("invalid domain rule %q", pattern)
 	}
+	// Domain rules match TLS hostnames. An IP literal here would be a rule
+	// that can never match; callers must send a CIDR instead.
+	if net.ParseIP(pattern) != nil {
+		return fmt.Errorf("domain rule %q is an IP literal; use a CIDR rule", pattern)
+	}
 	base := pattern
 	switch {
 	case strings.HasPrefix(base, "**."):
@@ -1214,7 +1219,7 @@ func policyDeny(policy *sandbox.NetworkPolicy) []sandbox.NetworkRule {
 func runtimeRules(rules []sandbox.NetworkRule) []runtime.Rule {
 	out := make([]runtime.Rule, 0, len(rules))
 	for i := range rules {
-		out = append(out, runtime.Rule{Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port, Domain: rules[i].Domain})
+		out = append(out, runtime.Rule{ID: rules[i].RuleID, Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port, Domain: rules[i].Domain})
 	}
 	return out
 }
