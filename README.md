@@ -68,9 +68,10 @@ only for the RPC and are never returned by `List`. A non-secret SQLite index
 supports listing and sandbox-scoped cleanup; the value itself never enters the
 database, logs, argv or sandbox snapshots. At exec time a whole-value `${secret:service}` environment reference is
 resolved from the host vault and passed only to that process; sandbox scope wins
-over global. A `${proxy:service}` reference starts a per-sandbox loopback HTTP
-reverse proxy with a fixed HTTPS upstream and injects the credential on the
-host. The guest receives only `http://192.168.127.254:<port>`, never the value. The value is not written to SQLite or sandbox metadata. This is an
+over global. A `${proxy:service}` reference is currently **fail-closed**: the host proxy is
+implemented and unit-tested, but the pinned guest network has no reliable
+guest-to-host route for an arbitrary loopback listener. The daemon returns a
+clear error instead of handing the guest an unreachable URL. The value is not written to SQLite or sandbox metadata. This is an
 explicit environment-injection mode: a guest root process can read its own
 environment, so it is weaker than Docker sbx's host proxy and is documented as
 such.

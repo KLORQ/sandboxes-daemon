@@ -164,7 +164,10 @@ func cancelableOutputs(req runtime.ExecRequest) bool {
 	return true
 }
 
-const secretRefPrefix = "${secret:"
+const (
+	secretRefPrefix = "${secret:"
+	proxyRefPrefix  = "${proxy:"
+)
 
 // resolveSecretEnv expands whole-value "${secret:service}" references from the
 // host vault at exec time. Only the selected process receives the value; it is
@@ -176,7 +179,14 @@ func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env 
 	out := make([]string, 0, len(env))
 	for _, entry := range env {
 		key, value, found := strings.Cut(entry, "=")
-		if !found || !strings.HasPrefix(value, secretRefPrefix) || !strings.HasSuffix(value, "}") {
+		if !found || !strings.HasSuffix(value, "}") {
+			out = append(out, entry)
+			continue
+		}
+		if strings.HasPrefix(value, proxyRefPrefix) {
+			return nil, fmt.Errorf("%w: host secret proxy transport is not available; use ${secret:service}", core.ErrConflict)
+		}
+		if !strings.HasPrefix(value, secretRefPrefix) {
 			out = append(out, entry)
 			continue
 		}
