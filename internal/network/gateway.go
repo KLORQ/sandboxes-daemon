@@ -88,7 +88,7 @@ var _ runtime.Network = (*Adapter)(nil)
 func toPolicyRules(rules []runtime.Rule, action policy.Action) []policy.Rule {
 	out := make([]policy.Rule, 0, len(rules))
 	for i := range rules {
-		out = append(out, policy.Rule{Action: action, Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port})
+		out = append(out, policy.Rule{Action: action, Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port, Domain: rules[i].Domain})
 	}
 	return out
 }

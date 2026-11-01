@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	runtime "github.com/KLORQ/sandboxes-runtime"
 
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
+	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
@@ -945,7 +947,7 @@ func TestConcurrentPolicyMutationsPreserveRevocation(t *testing.T) {
 		}
 	}
 	sb, err := svc.Get(ctx, op.SandboxID)
-	if err != nil || sb.Policy == nil || len(sb.Policy.Allow) != 1 || sb.Policy.Allow[0] != newRule {
+	if err != nil || sb.Policy == nil || len(sb.Policy.Allow) != 1 || !sameRule(sb.Policy.Allow[0], newRule) {
 		t.Fatalf("policy=%+v err=%v", sb.Policy, err)
 	}
 }
@@ -1184,5 +1186,115 @@ func TestCreatePassesPrivileged(t *testing.T) {
 	}
 	if !backend.lastConfig.Privileged {
 		t.Fatal("privileged request did not reach runtime")
+	}
+}
+
+func sameRule(a, b sandbox.NetworkRule) bool {
+	a.RuleID = ""
+	b.RuleID = ""
+	return a == b
+}
+
+func TestNormalizeDomainRules(t *testing.T) {
+	rule := sandbox.NetworkRule{Protocol: "tcp", Domain: "*.Example.COM.", Port: 443}
+	normalized, err := normalizeRules([]sandbox.NetworkRule{rule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized) != 1 || normalized[0].Domain != "*.example.com" || !strings.HasPrefix(normalized[0].RuleID, "rul_") {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "example.com", CIDR: "192.0.2.0/24"}}); err == nil {
+		t.Fatal("domain+cidr accepted")
+	}
+	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "*"}}); err == nil {
+		t.Fatal("bare wildcard accepted")
+	}
+}
+
+func TestGlobalPolicyMergesIntoNewSandboxes(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	rule := sandbox.NetworkRule{Protocol: "tcp", Domain: "*.example.com", Port: 443}
+	if _, _, err := svc.MutateGlobalPolicy(ctx, "allow", rule); err != nil {
+		t.Fatal(err)
+	}
+	op, err := svc.Create(ctx, CreateRequest{Name: "global-policy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := svc.Get(ctx, op.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allow, _, err := svc.effectivePolicy(ctx, sb)
+	if err != nil || len(allow) != 1 || allow[0].Domain != "*.example.com" {
+		t.Fatalf("effective allow=%+v err=%v", allow, err)
+	}
+	if _, _, err := svc.MutateGlobalPolicy(ctx, "rm", rule); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type fakeServiceSecretVault struct{ items map[string]string }
+
+func (f *fakeServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
+	f.items[service+"/"+account] = secret
+	return nil
+}
+
+func (f *fakeServiceSecretVault) Get(_ context.Context, service, account string) (string, error) {
+	value, ok := f.items[service+"/"+account]
+	if !ok {
+		return "", servicesecrets.ErrNotFound
+	}
+	return value, nil
+}
+
+func (f *fakeServiceSecretVault) Delete(_ context.Context, service, account string) error {
+	key := service + "/" + account
+	if _, ok := f.items[key]; !ok {
+		return servicesecrets.ErrNotFound
+	}
+	delete(f.items, key)
+	return nil
+}
+
+func TestServiceSecretNeverPersistsValue(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	secretStore, err := servicesecrets.NewStore(&fakeServiceSecretVault{items: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetServiceSecretStore(secretStore)
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeSandbox, "dev", []byte("sk-synthetic-value")); err != nil {
+		t.Fatal(err)
+	}
+	items, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(items) != 1 || items[0].Service != "openai" {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "sk-synthetic-value") {
+		t.Fatal("secret value was written to SQLite")
+	}
+	removed, err := svc.RemoveServiceSecret(ctx, "openai", servicesecrets.ScopeSandbox, "dev")
+	if err != nil || !removed {
+		t.Fatalf("removed=%v err=%v", removed, err)
 	}
 }

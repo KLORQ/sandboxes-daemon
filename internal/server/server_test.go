@@ -88,6 +88,14 @@ func TestGRPCLifecycle(t *testing.T) {
 	sandboxes := localv1.NewSandboxServiceClient(conn)
 	operations := localv1.NewOperationServiceClient(conn)
 
+	versionResp, err := sandboxes.GetVersion(ctx, &localv1.GetVersionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versionResp.GetVersion() == "" || versionResp.GetApiVersion() == "" {
+		t.Fatalf("version response = %+v", versionResp)
+	}
+
 	if _, err := sandboxes.Create(ctx, &localv1.CreateRequest{
 		Name: "invalid-deny", Deny: []*localv1.NetworkRule{{Protocol: "tcp", Cidr: "192.0.2.0/24", Port: 65536}},
 	}); status.Code(err) != codes.InvalidArgument {
