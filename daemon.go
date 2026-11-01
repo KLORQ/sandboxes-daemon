@@ -64,6 +64,13 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if cfg.DefaultImage != "" {
 		svc.DefaultImage = cfg.DefaultImage
 	}
+	svc.DockerVolumeDir = filepath.Join(cfg.StateDir, "docker")
+	if value := os.Getenv("DOCKER_SANDBOXES_DOCKER_SIZE"); value != "" {
+		svc.DockerVolumeSize = value
+	}
+	if value := os.Getenv("DOCKER_SANDBOXES_MKFS_EXT4"); value != "" {
+		svc.MkfsExt4 = value
+	}
 	changed, err := svc.Reconcile(ctx)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)

@@ -12,6 +12,8 @@ import (
 	"hash/fnv"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -52,6 +54,9 @@ type Service struct {
 	DefaultImage        string
 	DefaultCPUs         uint32
 	DefaultMemoryMiB    uint32
+	DockerVolumeDir     string
+	DockerVolumeSize    string
+	MkfsExt4            string
 	now                 func() time.Time
 	createGates         [64]chan struct{}
 	lifecycleGates      [64]chan struct{}
@@ -610,22 +615,38 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
+	if !req.Privileged {
+		if inspector, ok := s.backend.(runtime.ImageInspector); ok {
+			if labels, err := inspector.ImageLabels(ctx, image); err == nil && labels["com.docker.sandboxes.start-docker"] == "true" {
+				req.Privileged = true
+			}
+		}
+	}
+	var blockVolumes []runtime.BlockVolume
+	if req.Privileged {
+		volume, err := s.ensureDockerVolume(ctx, sbID)
+		if err != nil {
+			return operation.Operation{}, err
+		}
+		blockVolumes = append(blockVolumes, runtime.BlockVolume{Source: volume, Destination: "/var/lib/docker"})
+	}
 	state := sandbox.Stopped
 	var handle runtime.Handle
 	if s.backend != nil {
 		var err error
 		handle, err = s.backend.Create(ctx, runtime.Config{
-			Name:       name,
-			Image:      image,
-			Workspace:  workspace,
-			Workspaces: runtimeWorkspaces(workspaces),
-			Ports:      runtimePorts(ports),
-			Allow:      runtimeRules(allow),
-			Deny:       runtimeRules(deny),
-			CPUs:       uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
-			MemoryMiB:  memoryMiB,
-			Env:        env,
-			Privileged: req.Privileged,
+			Name:         name,
+			Image:        image,
+			Workspace:    workspace,
+			Workspaces:   runtimeWorkspaces(workspaces),
+			BlockVolumes: blockVolumes,
+			Ports:        runtimePorts(ports),
+			Allow:        runtimeRules(allow),
+			Deny:         runtimeRules(deny),
+			CPUs:         uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
+			MemoryMiB:    memoryMiB,
+			Env:          env,
+			Privileged:   req.Privileged,
 		})
 		if err != nil {
 			return operation.Operation{}, err
@@ -1280,6 +1301,83 @@ func (s *Service) dockerProfileEnabled(ctx context.Context, id string) (bool, er
 	return value == "true", nil
 }
 
+func (s *Service) removeDockerVolume(id string) error {
+	if s.DockerVolumeDir == "" {
+		return nil
+	}
+	err := os.Remove(filepath.Join(s.DockerVolumeDir, id+".ext4"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove docker volume: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) ensureDockerVolume(ctx context.Context, id string) (string, error) {
+	if s.DockerVolumeDir == "" {
+		return "", errors.New("docker volume directory is not configured")
+	}
+	if err := os.MkdirAll(s.DockerVolumeDir, 0o700); err != nil {
+		return "", fmt.Errorf("create docker volume directory: %w", err)
+	}
+	path := filepath.Join(s.DockerVolumeDir, id+".ext4")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat docker volume: %w", err)
+	}
+	size, err := parseVolumeSize(s.DockerVolumeSize)
+	if err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("create docker volume: %w", err)
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("size docker volume: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close docker volume: %w", err)
+	}
+	command := exec.CommandContext(ctx, s.MkfsExt4, "-q", "-F", path) // #nosec G204 -- operator-configured binary and generated path
+	if output, err := command.CombinedOutput(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("mkfs docker volume: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return path, nil
+}
+
+func parseVolumeSize(value string) (int64, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		value = "10g"
+	}
+	multiplier := int64(1)
+	switch value[len(value)-1] {
+	case 'g':
+		multiplier = 1 << 30
+		value = value[:len(value)-1]
+	case 'm':
+		multiplier = 1 << 20
+		value = value[:len(value)-1]
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid docker volume size %q", value)
+	}
+	size := n * multiplier
+	if size < 512<<20 {
+		return 0, fmt.Errorf("docker volume size must be at least 512 MiB")
+	}
+	return size, nil
+}
+
 func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, handle runtime.Handle) error {
 	if !enabled {
 		return nil
@@ -1296,7 +1394,7 @@ func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle)
 mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
 mount -o remount,rw /proc/sys 2>/dev/null || true
 echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-setsid dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs >/var/log/dockerd.log 2>&1 &
+setsid dockerd --host=unix:///var/run/docker.sock >/var/log/dockerd.log 2>&1 &
 for i in $(seq 1 50); do docker info >/dev/null 2>&1 && exit 0; sleep 0.2; done
 exit 1
 `
@@ -1669,6 +1767,9 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 		return operation.Operation{}, err
 	}
 	if err := s.cleanupSandboxRegistryCredentials(ctx, sb.Name); err != nil {
+		return op, err
+	}
+	if err := s.removeDockerVolume(id); err != nil {
 		return op, err
 	}
 	return op, nil
