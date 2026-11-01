@@ -1212,6 +1212,54 @@ func TestNormalizeDomainRules(t *testing.T) {
 	}
 }
 
+func TestCheckPolicyAppliesGlobalProfileRules(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	if _, err := svc.SetPolicyProfile(ctx, policyProfileAllowAll); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := svc.CheckPolicy(ctx, "", "tcp", "192.0.2.1", "", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Allowed {
+		t.Fatalf("global allow-all profile must allow IPv4 tcp, got %+v", decision)
+	}
+	if _, err := svc.SetPolicyProfile(ctx, policyProfileDenyAll); err != nil {
+		t.Fatal(err)
+	}
+	decision, err = svc.CheckPolicy(ctx, "", "tcp", "192.0.2.1", "", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed {
+		t.Fatalf("global deny-all profile must deny IPv4 tcp, got %+v", decision)
+	}
+	rule := sandbox.NetworkRule{Protocol: "tcp", Domain: "*.example.com", Port: 443}
+	if _, _, err := svc.MutateGlobalPolicy(ctx, "allow", rule); err != nil {
+		t.Fatal(err)
+	}
+	decision, err = svc.CheckPolicy(ctx, "", "tcp", "", "api.example.com", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Allowed {
+		t.Fatalf("explicit global domain rule must allow, got %+v", decision)
+	}
+	decision, err = svc.CheckPolicy(ctx, "", "udp", "", "api.example.com", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Allowed {
+		t.Fatalf("tcp-only domain rule must not allow udp, got %+v", decision)
+	}
+}
+
 func TestGlobalPolicyMergesIntoNewSandboxes(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
