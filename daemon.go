@@ -18,6 +18,7 @@ import (
 
 	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
+	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
 	"github.com/KLORQ/sandboxes-daemon/internal/server"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
 	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
@@ -63,9 +64,11 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 
 	svc := service.New(st, cfg.Backend)
 	applyConfig(svc, cfg)
-	if err := configureCredentialStores(svc); err != nil {
+	credentialCleanup, err := configureCredentialStores(svc)
+	if err != nil {
 		return err
 	}
+	defer func() { runErr = errors.Join(runErr, credentialCleanup()) }()
 	if cfg.DefaultImage != "" {
 		svc.DefaultImage = cfg.DefaultImage
 	}
@@ -119,18 +122,20 @@ func applyConfig(svc *service.Service, cfg Config) {
 	configureOAuth(svc, cfg)
 }
 
-func configureCredentialStores(svc *service.Service) error {
+func configureCredentialStores(svc *service.Service) (func() error, error) {
 	registryCredentialStore, err := registrycredentials.NewStore(registrycredentials.NativeVault{})
 	if err != nil {
-		return fmt.Errorf("create registry credential store: %w", err)
+		return nil, fmt.Errorf("create registry credential store: %w", err)
 	}
 	svc.SetRegistryCredentialStore(registryCredentialStore)
 	serviceSecretStore, err := servicesecrets.NewStore(servicesecrets.NativeVault{})
 	if err != nil {
-		return fmt.Errorf("create service secret store: %w", err)
+		return nil, fmt.Errorf("create service secret store: %w", err)
 	}
 	svc.SetServiceSecretStore(serviceSecretStore)
-	return nil
+	proxyManager := secretproxy.New()
+	svc.SetSecretProxyManager(proxyManager)
+	return proxyManager.Close, nil
 }
 
 func registerLocalServices(grpcServer *grpc.Server, svc *service.Service) {

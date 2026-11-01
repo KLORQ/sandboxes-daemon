@@ -31,6 +31,7 @@ import (
 
 	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
+	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
 	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
@@ -51,6 +52,7 @@ type Service struct {
 	backend              runtime.Backend
 	registryCredentials  *registrycredentials.Store
 	serviceSecrets       *servicesecrets.Store
+	secretProxies        *secretproxy.Manager
 	oauthProviders       map[string]OAuthProvider
 	oauthVaultStore      oauthsession.Vault
 	dockerHubAuth        http.RoundTripper
@@ -332,6 +334,11 @@ func (s *Service) SetRegistryCredentialStore(credentialStore *registrycredential
 // SetServiceSecretStore configures host-keychain storage for service secrets.
 func (s *Service) SetServiceSecretStore(secretStore *servicesecrets.Store) {
 	s.serviceSecrets = secretStore
+}
+
+// SetSecretProxyManager configures host-side service proxies.
+func (s *Service) SetSecretProxyManager(manager *secretproxy.Manager) {
+	s.secretProxies = manager
 }
 
 // SetServiceSecret stores one service secret and a non-secret index entry.
@@ -2049,6 +2056,11 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
+	if s.secretProxies != nil {
+		if err := s.secretProxies.StopSandbox(sb.Name); err != nil {
+			return operation.Operation{}, fmt.Errorf("stop secret proxies: %w", err)
+		}
+	}
 	op, err := s.apply(ctx, sb, operation.KindStop, sandbox.Stopped)
 	if err != nil && s.backend != nil {
 		return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
@@ -2078,6 +2090,11 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 	if s.backend != nil {
 		if err := s.backend.Delete(ctx, s.backend.Handle(sb.Name)); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+		}
+	}
+	if s.secretProxies != nil {
+		if err := s.secretProxies.StopSandbox(sb.Name); err != nil {
+			return operation.Operation{}, fmt.Errorf("stop secret proxies: %w", err)
 		}
 	}
 	now := s.now().UTC()
