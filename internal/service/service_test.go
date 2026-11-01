@@ -246,6 +246,14 @@ func (f *fakeRuntime) Create(_ context.Context, cfg runtime.Config) (runtime.Han
 	}
 	return runtime.Handle{ID: "klorq-" + cfg.Name}, nil
 }
+func (f *fakeRuntime) Exec(context.Context, runtime.Handle, runtime.ExecRequest) (int, error) {
+	return 0, nil
+}
+
+func (f *fakeRuntime) ExecNative(context.Context, runtime.Handle, runtime.ExecRequest) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeRuntime) Start(_ context.Context, h runtime.Handle) error {
 	f.started++
 	f.lastHandle = h
@@ -1156,5 +1164,22 @@ func TestPolicyProfileGlobalAndMetadata(t *testing.T) {
 	}
 	if _, err := svc.SetPolicyProfile(ctx, "unknown"); err == nil {
 		t.Fatal("unknown profile accepted")
+	}
+}
+
+func TestCreatePassesPrivileged(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "priv.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	if _, err := svc.Create(ctx, CreateRequest{Name: "priv", Privileged: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !backend.lastConfig.Privileged {
+		t.Fatal("privileged request did not reach runtime")
 	}
 }
