@@ -223,6 +223,7 @@ func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) 
 		Agent:          req.GetAgent(),
 		Detached:       req.GetDetached(),
 		PolicyProfile:  req.GetPolicyProfile(),
+		Privileged:     req.GetPrivileged(),
 		Env:            req.GetEnv(),
 	})
 	if err != nil {

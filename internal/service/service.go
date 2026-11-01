@@ -559,6 +559,7 @@ type CreateRequest struct {
 	Agent         string
 	Detached      bool
 	PolicyProfile string
+	Privileged    bool
 	// Env is baked into the sandbox runtime; it is never written to SQLite.
 	Env map[string]string
 }
@@ -626,9 +627,15 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 			CPUs:       uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
 			MemoryMiB:  memoryMiB,
 			Env:        env,
+			Privileged: req.Privileged,
 		})
 		if err != nil {
 			return operation.Operation{}, err
+		}
+		if req.Privileged {
+			if err := s.startDockerProfile(ctx, handle); err != nil {
+				return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")))
+			}
 		}
 		state = sandbox.Running
 	}
@@ -1220,6 +1227,27 @@ func mergePolicyRules(profile, explicit []sandbox.NetworkRule) []sandbox.Network
 		out = append(out, rule)
 	}
 	return out
+}
+
+func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle) error {
+	native, ok := s.backend.(runtime.NativeExecutor)
+	if !ok {
+		return errors.New("runtime does not support native docker profile startup")
+	}
+	script := `mkdir -p /sys/fs/cgroup
+mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
+mount -o remount,rw /proc/sys 2>/dev/null || true
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+setsid dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs >/var/log/dockerd.log 2>&1 &
+for i in $(seq 1 50); do docker info >/dev/null 2>&1 && exit 0; sleep 0.2; done
+exit 1
+`
+	if code, err := native.ExecNative(ctx, handle, runtime.ExecRequest{
+		Argv: []string{"/bin/sh", "-c", script}, User: "0:0",
+	}); err != nil || code != 0 {
+		return fmt.Errorf("start dockerd: code=%d err=%w", code, err)
+	}
+	return nil
 }
 
 type createIntent struct {
