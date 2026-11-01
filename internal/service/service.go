@@ -1726,7 +1726,7 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 
 // Delete removes a sandbox.
 //
-//nolint:gocyclo // Delete orchestrates runtime teardown, persistence and volume cleanup.
+//nolint:gocyclo,cyclop // Delete orchestrates runtime teardown, persistence and volume cleanup.
 func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.Operation, error) {
 	release, err := s.acquireLifecycle(ctx, id)
 	if err != nil {
