@@ -1326,3 +1326,25 @@ func TestResolveSecretEnvFailsClosedAndScopes(t *testing.T) {
 		t.Fatal("missing secret did not fail closed")
 	}
 }
+
+func TestResolveProxyEnvFailsClosedUntilTransportExists(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	secretStore, err := servicesecrets.NewStore(&fakeServiceSecretVault{items: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetServiceSecretStore(secretStore)
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("sk-synthetic-proxy")); err != nil {
+		t.Fatal(err)
+	}
+	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"OPENAI_BASE_URL=${proxy:openai}"})
+	if err == nil || !strings.Contains(err.Error(), "transport is not available") || len(env) != 0 {
+		t.Fatalf("env=%q err=%v", env, err)
+	}
+}
