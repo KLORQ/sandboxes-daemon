@@ -434,7 +434,18 @@ func (s *Service) CheckPolicy(ctx context.Context, id, protocol, address, domain
 func (s *Service) checkPolicyRules(ctx context.Context, id string) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
 	if id == "" {
 		allow, deny, err := s.GlobalPolicy(ctx)
-		return allow, deny, err
+		if err != nil {
+			return nil, nil, err
+		}
+		profile, err := s.GetPolicyProfile(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		_, profileRules, err := normalizePolicyProfile(profile)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mergePolicyRules(profileRules, allow), deny, nil
 	}
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
