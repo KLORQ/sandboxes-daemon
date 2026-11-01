@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
+	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
@@ -44,25 +46,28 @@ const (
 
 // Service coordinates durable sandbox state and operations.
 type Service struct {
-	store               *store.Store
-	journal             *operation.Journal
-	backend             runtime.Backend
-	registryCredentials *registrycredentials.Store
-	oauthProviders      map[string]OAuthProvider
-	oauthVaultStore     oauthsession.Vault
-	dockerHubAuth       http.RoundTripper
-	DefaultImage        string
-	DefaultCPUs         uint32
-	DefaultMemoryMiB    uint32
-	DockerVolumeDir     string
-	DockerVolumeSize    string
-	MkfsExt4            string
-	now                 func() time.Time
-	createGates         [64]chan struct{}
-	lifecycleGates      [64]chan struct{}
-	credentialGates     [64]chan struct{}
-	execMu              sync.Mutex
-	execSessions        map[string]map[*execSession]struct{}
+	store                *store.Store
+	journal              *operation.Journal
+	backend              runtime.Backend
+	registryCredentials  *registrycredentials.Store
+	serviceSecrets       *servicesecrets.Store
+	oauthProviders       map[string]OAuthProvider
+	oauthVaultStore      oauthsession.Vault
+	dockerHubAuth        http.RoundTripper
+	DefaultImage         string
+	DefaultCPUs          uint32
+	DefaultMemoryMiB     uint32
+	DefaultPolicyProfile string
+	DockerVolumeDir      string
+	DockerVolumeSize     string
+	MkfsExt4             string
+	now                  func() time.Time
+	createGates          [64]chan struct{}
+	lifecycleGates       [64]chan struct{}
+	credentialGates      [64]chan struct{}
+	execMu               sync.Mutex
+	execSessions         map[string]map[*execSession]struct{}
+	globalPolicyMu       sync.Mutex
 }
 
 const dockerHubRegistry = "docker.io"
@@ -324,6 +329,64 @@ func (s *Service) SetRegistryCredentialStore(credentialStore *registrycredential
 	s.registryCredentials = credentialStore
 }
 
+// SetServiceSecretStore configures host-keychain storage for service secrets.
+func (s *Service) SetServiceSecretStore(secretStore *servicesecrets.Store) {
+	s.serviceSecrets = secretStore
+}
+
+// SetServiceSecret stores one service secret and a non-secret index entry.
+func (s *Service) SetServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
+	if s.serviceSecrets == nil {
+		return servicesecrets.Summary{}, errors.New("service secret store is unavailable")
+	}
+	release, err := s.acquireCredentialGate(ctx, "service-secret/"+service+"/"+string(scope)+"/"+sandboxName)
+	if err != nil {
+		return servicesecrets.Summary{}, err
+	}
+	defer release()
+	summary, err := s.serviceSecrets.Save(ctx, service, scope, sandboxName, value)
+	if err != nil {
+		return servicesecrets.Summary{}, err
+	}
+	if err := s.store.UpsertServiceSecretIndex(ctx, store.ServiceSecretIndex{
+		Service: summary.Service, Scope: string(summary.Scope), SandboxName: summary.SandboxName,
+	}); err != nil {
+		_, _ = s.serviceSecrets.Delete(ctx, summary.Service, summary.Scope, summary.SandboxName)
+		return servicesecrets.Summary{}, err
+	}
+	return summary, nil
+}
+
+// ListServiceSecrets returns non-secret summaries.
+func (s *Service) ListServiceSecrets(ctx context.Context) ([]servicesecrets.Summary, error) {
+	entries, err := s.store.ListServiceSecretIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]servicesecrets.Summary, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, servicesecrets.Summary{
+			Service: entry.Service, Scope: servicesecrets.Scope(entry.Scope), SandboxName: entry.SandboxName,
+		})
+	}
+	return out, nil
+}
+
+// RemoveServiceSecret deletes one service secret from the host keychain.
+func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string) (bool, error) {
+	if s.serviceSecrets == nil {
+		return false, errors.New("service secret store is unavailable")
+	}
+	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
+	if err != nil || !removed {
+		return removed, err
+	}
+	if err := s.store.DeleteServiceSecretIndex(ctx, strings.ToLower(strings.TrimSpace(service)), string(scope), sandboxName); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // SetDockerHubAuthTransport injects the HTTP transport used only to validate
 // Docker Hub username/PAT login. Production uses a direct TLS transport.
 func (s *Service) SetDockerHubAuthTransport(transport http.RoundTripper) {
@@ -475,6 +538,28 @@ func (s *Service) cleanupSandboxRegistryCredentials(ctx context.Context, sandbox
 	}
 	if err := s.deleteSandboxRegistryCredentials(ctx, sandboxName); err != nil {
 		return fmt.Errorf("remove sandbox registry credentials: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) cleanupSandboxServiceSecrets(ctx context.Context, sandboxName string) error {
+	if s.serviceSecrets == nil {
+		return nil
+	}
+	entries, err := s.store.ListServiceSecretIndex(ctx)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Scope != string(servicesecrets.ScopeSandbox) || entry.SandboxName != sandboxName {
+			continue
+		}
+		if _, err := s.serviceSecrets.Delete(ctx, entry.Service, servicesecrets.ScopeSandbox, sandboxName); err != nil {
+			return err
+		}
+		if err := s.store.DeleteServiceSecretIndex(ctx, entry.Service, entry.Scope, entry.SandboxName); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -633,6 +718,10 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	state := sandbox.Stopped
 	var handle runtime.Handle
 	if s.backend != nil {
+		effectiveAllow, effectiveDeny, policyErr := s.effectiveRules(ctx, allow, deny)
+		if policyErr != nil {
+			return operation.Operation{}, policyErr
+		}
 		var err error
 		handle, err = s.backend.Create(ctx, runtime.Config{
 			Name:         name,
@@ -641,8 +730,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 			Workspaces:   runtimeWorkspaces(workspaces),
 			BlockVolumes: blockVolumes,
 			Ports:        runtimePorts(ports),
-			Allow:        runtimeRules(allow),
-			Deny:         runtimeRules(deny),
+			Allow:        runtimeRules(effectiveAllow),
+			Deny:         runtimeRules(effectiveDeny),
 			CPUs:         uint8(cpus), //nolint:gosec // resolveCreateResources bounds cpus to 1..64.
 			MemoryMiB:    memoryMiB,
 			Env:          env,
@@ -949,6 +1038,7 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 		return nil, fmt.Errorf("%w: too many network rules", core.ErrConflict)
 	}
 	out := make([]sandbox.NetworkRule, 0, len(rules))
+	seen := make(map[string]struct{}, len(rules))
 	for _, rule := range rules {
 		if rule.Protocol == "" {
 			rule.Protocol = tcpProtocol
@@ -956,13 +1046,77 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 		if rule.Protocol != tcpProtocol && rule.Protocol != udpProtocol {
 			return nil, fmt.Errorf("%w: network rule protocol must be tcp or udp", core.ErrConflict)
 		}
-		ip, _, err := net.ParseCIDR(rule.CIDR)
-		if err != nil || ip.To4() == nil {
-			return nil, fmt.Errorf("%w: network rule CIDR must be IPv4", core.ErrConflict)
+		rule.Domain = normalizeDomainPattern(rule.Domain)
+		switch {
+		case rule.Domain != "" && rule.CIDR != "":
+			return nil, fmt.Errorf("%w: network rule must specify either domain or CIDR, not both", core.ErrConflict)
+		case rule.Domain != "":
+			if err := validateDomainPattern(rule.Domain); err != nil {
+				return nil, fmt.Errorf("%w: %w", core.ErrConflict, err)
+			}
+		default:
+			ip, _, err := net.ParseCIDR(rule.CIDR)
+			if err != nil || ip.To4() == nil {
+				return nil, fmt.Errorf("%w: network rule CIDR must be IPv4", core.ErrConflict)
+			}
 		}
+		key := rule.Protocol + "|" + rule.CIDR + "|" + rule.Domain + "|" + strconv.Itoa(int(rule.Port))
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		rule.RuleID = networkRuleID(rule)
 		out = append(out, rule)
 	}
 	return out, nil
+}
+
+func normalizeDomainPattern(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.TrimSuffix(domain, ".")
+}
+
+// validateDomainPattern accepts exact names, *.example.com,
+// **.example.com, and single-label ? or [] globs. A bare * and backslashes are
+// rejected so a rule cannot silently match nothing.
+//
+//nolint:gocognit,gocyclo,cyclop // one compact grammar validator is clearer than a dispatch table.
+func validateDomainPattern(pattern string) error {
+	if pattern == "" || len(pattern) > 253 || strings.ContainsAny(pattern, "\\ ") {
+		return fmt.Errorf("invalid domain rule %q", pattern)
+	}
+	base := pattern
+	switch {
+	case strings.HasPrefix(base, "**."):
+		base = strings.TrimPrefix(base, "**.")
+	case strings.HasPrefix(base, "*."):
+		base = strings.TrimPrefix(base, "*.")
+	}
+	if base == "" || base == "*" || strings.Contains(base, "*") {
+		return fmt.Errorf("invalid domain rule %q", pattern)
+	}
+	for _, label := range strings.Split(base, ".") {
+		if label == "" || len(label) > 63 {
+			return fmt.Errorf("invalid domain rule %q", pattern)
+		}
+		if strings.ContainsAny(label, "[]!?") {
+			if !strings.Contains(label, "?") && !strings.Contains(label, "[") {
+				return fmt.Errorf("invalid domain rule %q", pattern)
+			}
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '?' || r == '[' || r == ']' || r == '!' {
+				continue
+			}
+			return fmt.Errorf("invalid domain rule %q", pattern)
+		}
+	}
+	return nil
+}
+
+func networkRuleID(rule sandbox.NetworkRule) string {
+	sum := sha256.Sum256([]byte(rule.Protocol + "\x00" + rule.CIDR + "\x00" + rule.Domain + "\x00" + strconv.Itoa(int(rule.Port))))
+	return "rul_" + hex.EncodeToString(sum[:8])
 }
 
 func networkPolicy(allow, deny []sandbox.NetworkRule) *sandbox.NetworkPolicy {
@@ -989,7 +1143,7 @@ func policyDeny(policy *sandbox.NetworkPolicy) []sandbox.NetworkRule {
 func runtimeRules(rules []sandbox.NetworkRule) []runtime.Rule {
 	out := make([]runtime.Rule, 0, len(rules))
 	for i := range rules {
-		out = append(out, runtime.Rule{Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port})
+		out = append(out, runtime.Rule{Protocol: rules[i].Protocol, CIDR: rules[i].CIDR, Port: rules[i].Port, Domain: rules[i].Domain})
 	}
 	return out
 }
@@ -1180,19 +1334,165 @@ func (s *Service) normalizeCreatePolicy(ctx context.Context, req CreateRequest) 
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	return profile, ports, mergePolicyRules(rules, allow), deny, nil
+	allow, err = normalizeRules(mergePolicyRules(rules, allow))
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	deny, err = normalizeRules(deny)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	return profile, ports, allow, deny, nil
+}
+
+// effectivePolicy combines global rules with the sandbox snapshot. Global
+// rules are never copied into the stored snapshot, so changing them affects
+// only the live gateway and future starts.
+func (s *Service) effectivePolicy(ctx context.Context, sb sandbox.Sandbox) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	return s.effectiveRules(ctx, policyAllow(sb.Policy), policyDeny(sb.Policy))
+}
+
+func (s *Service) effectiveRules(ctx context.Context, allow, deny []sandbox.NetworkRule) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	globalAllow, globalDeny, err := s.GlobalPolicy(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	effectiveAllow, err := normalizeRules(mergePolicyRules(globalAllow, allow))
+	if err != nil {
+		return nil, nil, err
+	}
+	effectiveDeny, err := normalizeRules(mergePolicyRules(globalDeny, deny))
+	if err != nil {
+		return nil, nil, err
+	}
+	return effectiveAllow, effectiveDeny, nil
+}
+
+const (
+	globalAllowSetting = "policy.global.allow"
+	globalDenySetting  = "policy.global.deny"
+)
+
+// GlobalPolicy returns the global network rules applied to every new sandbox.
+func (s *Service) GlobalPolicy(ctx context.Context) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	allow, err := s.loadGlobalRules(ctx, globalAllowSetting)
+	if err != nil {
+		return nil, nil, err
+	}
+	deny, err := s.loadGlobalRules(ctx, globalDenySetting)
+	if err != nil {
+		return nil, nil, err
+	}
+	return allow, deny, nil
+}
+
+func (s *Service) loadGlobalRules(ctx context.Context, key string) ([]sandbox.NetworkRule, error) {
+	encoded, err := s.store.GetSetting(ctx, key)
+	if errors.Is(err, core.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rules []sandbox.NetworkRule
+	if err := json.Unmarshal([]byte(encoded), &rules); err != nil {
+		return nil, fmt.Errorf("%w: global policy %s is corrupt", core.ErrConflict, key)
+	}
+	return normalizeRules(rules)
+}
+
+// MutateGlobalPolicy changes one global rule. Deny wins at connection time.
+func (s *Service) MutateGlobalPolicy(ctx context.Context, action string, rule sandbox.NetworkRule) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	s.globalPolicyMu.Lock()
+	defer s.globalPolicyMu.Unlock()
+	allow, deny, err := s.GlobalPolicy(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	normalized, err := normalizeRules([]sandbox.NetworkRule{rule})
+	if err != nil || len(normalized) != 1 {
+		return nil, nil, fmt.Errorf("%w: invalid policy rule", core.ErrConflict)
+	}
+	rule = normalized[0]
+	switch action {
+	case "allow":
+		if slices.Contains(allow, rule) {
+			return nil, nil, fmt.Errorf("%w: allow rule already exists", core.ErrConflict)
+		}
+		allow = append(allow, rule)
+	case "deny":
+		if slices.Contains(deny, rule) {
+			return nil, nil, fmt.Errorf("%w: deny rule already exists", core.ErrConflict)
+		}
+		deny = append(deny, rule)
+	case "rm":
+		if !slices.Contains(allow, rule) && !slices.Contains(deny, rule) {
+			return nil, nil, fmt.Errorf("%w: policy rule not found", core.ErrConflict)
+		}
+		allow = slices.DeleteFunc(allow, func(r sandbox.NetworkRule) bool { return r == rule })
+		deny = slices.DeleteFunc(deny, func(r sandbox.NetworkRule) bool { return r == rule })
+	default:
+		return nil, nil, fmt.Errorf("%w: invalid policy action", core.ErrConflict)
+	}
+	if err := s.storeGlobalRules(ctx, globalAllowSetting, allow); err != nil {
+		return nil, nil, err
+	}
+	if err := s.storeGlobalRules(ctx, globalDenySetting, deny); err != nil {
+		return nil, nil, err
+	}
+	s.globalPolicyMu.Unlock()
+	err = s.refreshRunningPolicies(ctx)
+	s.globalPolicyMu.Lock()
+	if err != nil {
+		return allow, deny, err
+	}
+	return allow, deny, nil
+}
+
+// refreshRunningPolicies applies a changed global policy to running sandboxes.
+// A failed reload stops that sandbox rather than leaving old rules active.
+func (s *Service) refreshRunningPolicies(ctx context.Context) error {
+	sandboxes, _, err := s.store.List(ctx, sandbox.ListOptions{PageSize: 1000})
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for i := range sandboxes {
+		sb := sandboxes[i]
+		if sb.State != sandbox.Running {
+			continue
+		}
+		if _, err := s.UpdatePolicy(ctx, sb.ID, policyAllow(sb.Policy), policyDeny(sb.Policy)); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (s *Service) storeGlobalRules(ctx context.Context, key string, rules []sandbox.NetworkRule) error {
+	encoded, err := json.Marshal(rules)
+	if err != nil {
+		return fmt.Errorf("encode global policy: %w", err)
+	}
+	return s.store.SetSetting(ctx, key, string(encoded))
 }
 
 // GetPolicyProfile returns the global default profile for new sandboxes.
 func (s *Service) GetPolicyProfile(ctx context.Context) (string, error) {
 	profile, err := s.store.GetSetting(ctx, policyProfileSetting)
 	if errors.Is(err, core.ErrNotFound) {
+		if s.DefaultPolicyProfile != "" {
+			return s.DefaultPolicyProfile, nil
+		}
 		return policyProfileDenyAll, nil
 	}
 	if err != nil {
 		return "", err
 	}
 	if profile == "" {
+		if s.DefaultPolicyProfile != "" {
+			return s.DefaultPolicyProfile, nil
+		}
 		return policyProfileDenyAll, nil
 	}
 	return profile, nil
@@ -1271,10 +1571,14 @@ func (s *Service) setDockerProfile(ctx context.Context, id string, enabled bool)
 }
 
 func (s *Service) startRuntimeSandbox(ctx context.Context, sb sandbox.Sandbox) error {
+	allow, deny, err := s.effectivePolicy(ctx, sb)
+	if err != nil {
+		return err
+	}
 	handle := s.backend.Handle(sb.Name)
 	handle.Ports = runtimePorts(sb.Ports)
-	handle.Allow = runtimeRules(policyAllow(sb.Policy))
-	handle.Deny = runtimeRules(policyDeny(sb.Policy))
+	handle.Allow = runtimeRules(allow)
+	handle.Deny = runtimeRules(deny)
 	if err := s.backend.Start(ctx, handle); err != nil {
 		return err
 	}
@@ -1671,6 +1975,7 @@ func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny
 	if sb.State != sandbox.Running && sb.State != sandbox.Stopped {
 		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is not ready for a policy update", core.ErrConflict)
 	}
+	//nolint:nestif // live update persists uncertain state before touching the runtime.
 	if sb.State == sandbox.Running {
 		updater, ok := s.backend.(runtime.PolicyUpdater)
 		if !ok {
@@ -1678,6 +1983,7 @@ func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny
 		}
 		// Persist the intended policy and an uncertain runtime state before any
 		// live change. A crash or a failed reload must never restore old rules.
+		previousPolicy := sb.Policy
 		sb.Policy = networkPolicy(normalizedAllow, normalizedDeny)
 		sb.State = sandbox.Unknown
 		sb.Error = "policy update in progress; runtime state is unknown"
@@ -1685,9 +1991,14 @@ func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny
 		if err := s.store.Update(ctx, sb); err != nil {
 			return sandbox.Sandbox{}, err
 		}
+		allow, deny, policyErr := s.effectivePolicy(ctx, sb)
+		if policyErr != nil {
+			sb.Policy = previousPolicy
+			return sandbox.Sandbox{}, policyErr
+		}
 		handle := s.backend.Handle(sb.Name)
 		handle.Ports = runtimePorts(sb.Ports)
-		if err := updater.UpdatePolicy(ctx, handle, runtimeRules(normalizedAllow), runtimeRules(normalizedDeny), revision); err != nil {
+		if err := updater.UpdatePolicy(ctx, handle, runtimeRules(allow), runtimeRules(deny), revision); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			stopErr := s.backend.Stop(cleanupCtx, handle, 5*time.Second)
 			cancel()
@@ -1788,6 +2099,9 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 		return operation.Operation{}, err
+	}
+	if err := s.cleanupSandboxServiceSecrets(ctx, sb.Name); err != nil {
+		return op, err
 	}
 	if err := s.cleanupSandboxRegistryCredentials(ctx, sb.Name); err != nil {
 		return op, err

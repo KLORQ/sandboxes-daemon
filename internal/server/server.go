@@ -574,7 +574,7 @@ func fromProtoPorts(ports []*localv1.Port) []sandbox.Port {
 func toProtoRules(rules []sandbox.NetworkRule) []*localv1.NetworkRule {
 	out := make([]*localv1.NetworkRule, 0, len(rules))
 	for i := range rules {
-		out = append(out, &localv1.NetworkRule{Protocol: rules[i].Protocol, Cidr: rules[i].CIDR, Port: uint32(rules[i].Port)})
+		out = append(out, &localv1.NetworkRule{Protocol: rules[i].Protocol, Cidr: rules[i].CIDR, Port: uint32(rules[i].Port), Domain: rules[i].Domain, RuleId: rules[i].RuleID})
 	}
 	return out
 }
@@ -585,7 +585,7 @@ func fromProtoRules(rules []*localv1.NetworkRule) []sandbox.NetworkRule {
 		if rule == nil || rule.GetPort() > 65535 {
 			continue
 		}
-		out = append(out, sandbox.NetworkRule{Protocol: rule.GetProtocol(), CIDR: rule.GetCidr(), Port: uint16(rule.GetPort())}) //nolint:gosec // port is bounded to 65535 above.
+		out = append(out, sandbox.NetworkRule{Protocol: rule.GetProtocol(), CIDR: rule.GetCidr(), Port: uint16(rule.GetPort()), Domain: rule.GetDomain(), RuleID: rule.GetRuleId()}) //nolint:gosec // port is bounded to 65535 above.
 	}
 	return out
 }
@@ -630,4 +630,26 @@ func metaLastUsedNano(sb sandbox.Sandbox) int64 {
 		return 0
 	}
 	return sb.Meta.LastUsedAt.UnixNano()
+}
+
+// GetGlobalPolicy returns the global network rules applied to new sandboxes.
+func (s *SandboxServer) GetGlobalPolicy(ctx context.Context, _ *localv1.GetGlobalPolicyRequest) (*localv1.GetGlobalPolicyResponse, error) {
+	allow, deny, err := s.svc.GlobalPolicy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &localv1.GetGlobalPolicyResponse{Allow: toProtoRules(allow), Deny: toProtoRules(deny)}, nil
+}
+
+// MutateGlobalPolicy changes one global rule atomically.
+func (s *SandboxServer) MutateGlobalPolicy(ctx context.Context, req *localv1.MutateGlobalPolicyRequest) (*localv1.MutateGlobalPolicyResponse, error) {
+	rules := fromProtoRules([]*localv1.NetworkRule{req.GetRule()})
+	if len(rules) != 1 {
+		return nil, status.Error(codes.InvalidArgument, "one valid rule is required")
+	}
+	allow, deny, err := s.svc.MutateGlobalPolicy(ctx, req.GetAction(), rules[0])
+	if err != nil {
+		return nil, err
+	}
+	return &localv1.MutateGlobalPolicyResponse{Allow: toProtoRules(allow), Deny: toProtoRules(deny)}, nil
 }

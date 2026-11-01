@@ -101,6 +101,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			value TEXT NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS service_secret_index (
+			service TEXT NOT NULL,
+			scope TEXT NOT NULL,
+			sandbox_name TEXT NOT NULL DEFAULT '',
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (service, scope, sandbox_name)
+		)`,
 		`CREATE TABLE IF NOT EXISTS registry_credential_index (
 			registry TEXT NOT NULL,
 			scope TEXT NOT NULL,
@@ -728,6 +735,53 @@ func (s *Store) ListRegistryCredentialIndex(ctx context.Context) ([]RegistryCred
 		var entry RegistryCredentialIndex
 		if err := rows.Scan(&entry.Registry, &entry.Username, &entry.Scope, &entry.SandboxName); err != nil {
 			return nil, fmt.Errorf("scan registry credential index: %w", err)
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
+// ServiceSecretIndex is non-secret metadata for a stored service secret.
+type ServiceSecretIndex struct {
+	Service     string
+	Scope       string
+	SandboxName string
+}
+
+// UpsertServiceSecretIndex records a non-secret service secret summary.
+func (s *Store) UpsertServiceSecretIndex(ctx context.Context, entry ServiceSecretIndex) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO service_secret_index (service, scope, sandbox_name, updated_at)
+		VALUES (?,?,?,?)
+		ON CONFLICT(service, scope, sandbox_name) DO UPDATE SET updated_at=excluded.updated_at`,
+		entry.Service, entry.Scope, entry.SandboxName, time.Now().UTC().Unix())
+	if err != nil {
+		return fmt.Errorf("record service secret index: %w", err)
+	}
+	return nil
+}
+
+// DeleteServiceSecretIndex removes one non-secret service secret summary.
+func (s *Store) DeleteServiceSecretIndex(ctx context.Context, service, scope, sandboxName string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM service_secret_index WHERE service=? AND scope=? AND sandbox_name=?`,
+		service, scope, sandboxName)
+	if err != nil {
+		return fmt.Errorf("delete service secret index: %w", err)
+	}
+	return nil
+}
+
+// ListServiceSecretIndex lists non-secret service secret summaries.
+func (s *Store) ListServiceSecretIndex(ctx context.Context) ([]ServiceSecretIndex, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT service, scope, sandbox_name FROM service_secret_index ORDER BY service, scope, sandbox_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list service secret index: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ServiceSecretIndex
+	for rows.Next() {
+		var entry ServiceSecretIndex
+		if err := rows.Scan(&entry.Service, &entry.Scope, &entry.SandboxName); err != nil {
+			return nil, fmt.Errorf("scan service secret index: %w", err)
 		}
 		out = append(out, entry)
 	}

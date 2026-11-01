@@ -20,6 +20,7 @@ import (
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
 	"github.com/KLORQ/sandboxes-daemon/internal/server"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
+	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
@@ -32,6 +33,12 @@ type Config struct {
 	Cleanup        func() error
 	OAuthProviders map[string]service.OAuthProvider
 	OAuthVault     oauthsession.Vault
+	// Settings are optional host-side overrides loaded before the daemon starts.
+	DNSUpstream          string
+	DefaultPolicyProfile string
+	DefaultCPUs          uint32
+	DefaultMemoryMiB     uint32
+	DockerVolumeSize     string
 }
 
 // Run starts the daemon and blocks until ctx is canceled.
@@ -55,12 +62,10 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	defer func() { _ = st.Close() }()
 
 	svc := service.New(st, cfg.Backend)
-	configureOAuth(svc, cfg)
-	registryCredentialStore, err := registrycredentials.NewStore(registrycredentials.NativeVault{})
-	if err != nil {
-		return fmt.Errorf("create registry credential store: %w", err)
+	applyConfig(svc, cfg)
+	if err := configureCredentialStores(svc); err != nil {
+		return err
 	}
-	svc.SetRegistryCredentialStore(registryCredentialStore)
 	if cfg.DefaultImage != "" {
 		svc.DefaultImage = cfg.DefaultImage
 	}
@@ -100,11 +105,40 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	return nil
 }
 
+func applyConfig(svc *service.Service, cfg Config) {
+	if cfg.DefaultCPUs != 0 {
+		svc.DefaultCPUs = cfg.DefaultCPUs
+	}
+	if cfg.DefaultMemoryMiB != 0 {
+		svc.DefaultMemoryMiB = cfg.DefaultMemoryMiB
+	}
+	svc.DefaultPolicyProfile = cfg.DefaultPolicyProfile
+	if cfg.DockerVolumeSize != "" {
+		svc.DockerVolumeSize = cfg.DockerVolumeSize
+	}
+	configureOAuth(svc, cfg)
+}
+
+func configureCredentialStores(svc *service.Service) error {
+	registryCredentialStore, err := registrycredentials.NewStore(registrycredentials.NativeVault{})
+	if err != nil {
+		return fmt.Errorf("create registry credential store: %w", err)
+	}
+	svc.SetRegistryCredentialStore(registryCredentialStore)
+	serviceSecretStore, err := servicesecrets.NewStore(servicesecrets.NativeVault{})
+	if err != nil {
+		return fmt.Errorf("create service secret store: %w", err)
+	}
+	svc.SetServiceSecretStore(serviceSecretStore)
+	return nil
+}
+
 func registerLocalServices(grpcServer *grpc.Server, svc *service.Service) {
 	localv1.RegisterSandboxServiceServer(grpcServer, server.NewSandbox(svc))
 	localv1.RegisterOperationServiceServer(grpcServer, server.NewOperation(svc))
 	localv1.RegisterRegistryCredentialServiceServer(grpcServer, server.NewRegistryCredential(svc))
 	localv1.RegisterAccountServiceServer(grpcServer, server.NewAccount(svc))
+	localv1.RegisterSecretServiceServer(grpcServer, server.NewSecret(svc))
 }
 
 func configureOAuth(svc *service.Service, cfg Config) {
