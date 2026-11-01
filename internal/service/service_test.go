@@ -1176,6 +1176,9 @@ func TestCreatePassesPrivileged(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	backend := &fakeRuntime{}
 	svc := New(st, backend)
+	svc.DockerVolumeDir = t.TempDir()
+	svc.DockerVolumeSize = "512m"
+	svc.MkfsExt4 = "true"
 	if _, err := svc.Create(ctx, CreateRequest{Name: "priv", Privileged: true}); err != nil {
 		t.Fatal(err)
 	}
